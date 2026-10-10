@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Exercise the production paged SPIR-V emitter and portable label writer on a real Vulkan GPU.
+#include "gpu_release_headers.h"
 #include <array>
 #include <cassert>
 #include <chrono>
@@ -19,8 +20,12 @@ int main(int argc, char** argv) {
     using namespace Vulkan;
     using namespace Shader;
     // The regression must exercise no AMD marker commands, including diagnostic breadcrumbs.
+#ifdef _WIN32
+    _putenv_s("BB_BREADCRUMBS","0");
+#else
     setenv("BB_BREADCRUMBS","0",1);
-    Instance instance(0, true);
+#endif
+    Instance instance(0, false);
     static vk::detail::DynamicLoader loader;
     vk::detail::DispatchLoaderDynamic d;
     d.init(loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
@@ -68,7 +73,8 @@ int main(int argc, char** argv) {
 
     Info info{};
     info.hw_stage=HwStage::Compute; info.sw_stage=SwStage::Compute;
-    info.pgm_hash=BufferCopyShaderHash; info.uses_paged_buffers=true;
+    constexpr u64 CopyShaderHash=0xfefebf9f;
+    info.pgm_hash=CopyShaderHash; info.uses_paged_buffers=true;
     for (u32 i=0;i<3;++i) {
         BufferResource buffer{};
         buffer.buffer_type=i==2 ? BufferType::BdaPagetable : BufferType::Guest;
@@ -94,6 +100,7 @@ int main(int argc, char** argv) {
     runtime.hw.cs.workgroup_size={1,1,1};
     Profile profile{}; profile.supported_spirv=0x00010600; profile.support_int64=true;
     profile.paged_buffers=true; profile.sparse_page_shift=16;
+    profile.buffer_copy_shader_hash=CopyShaderHash;
     Backend::Bindings bindings{};
     const auto code=Backend::SPIRV::EmitSPIRV(profile,runtime,program,bindings);
     if (argc>1) {

@@ -16,14 +16,20 @@ typedef int32_t (ABI *CountOp)(uint32_t,int32_t);
 typedef int32_t (ABI *Wait)(uint32_t,int32_t,uint32_t *);
 typedef int32_t (ABI *Delete)(uint32_t);
 typedef int32_t (ABI *Cancel)(uint32_t,int32_t,int32_t *);
+#ifdef BB_SEMA_STANDALONE
+#define GET(t,n) ((t)runtime_sema_resolve(n))
+#else
 #define GET(t,n) ((t)runtime_resolve(n,0))
+#endif
 static Create create;
 static CountOp poll_sem,signal_sem;
 static Wait wait_sem;
 static Delete delete_sem;
 static Cancel cancel_sem;
 static void setup(void) {
+#ifndef BB_SEMA_STANDALONE
     runtime_start(1);
+#endif
     create=GET(Create,"188x57JYp0g#p#J");
     poll_sem=GET(CountOp,"12wOHk8ywb0#p#J");
     signal_sem=GET(CountOp,"4czppHBiriw#p#J");
@@ -31,8 +37,10 @@ static void setup(void) {
     delete_sem=GET(Delete,"R1Jvn8bSCW8#p#J");
     cancel_sem=GET(Cancel,"4DM06U2BNEY#p#J");
     assert(create && poll_sem && signal_sem && wait_sem && delete_sem && cancel_sem);
-    assert(!runtime_resolve("188x57JYp0g#I#J",0));
+    assert(!runtime_sema_resolve("188x57JYp0g#I#J"));
+#ifndef BB_SEMA_STANDALONE
     assert(!runtime_resolve("188x57JYp0g#p#J",1));
+#endif
 }
 static void lifecycle(void) {
     struct { uint32_t handle,canary; } s={0,0xdeadbeef};
@@ -66,6 +74,7 @@ static void lifecycle(void) {
 }
 typedef struct { uint32_t id; int32_t need,result; uint32_t timeout; } Task;
 static void *waiter(void *p) { Task *t=p; t->result=wait_sem(t->id,t->need,&t->timeout); return NULL; }
+static void *untimed_waiter(void *p) { Task *t=p; t->result=wait_sem(t->id,t->need,NULL); return NULL; }
 static void enrolled(uint32_t id,unsigned count) {
     const struct timespec nap={0,1000000};
     for (int i=0;i<2000;++i) {
@@ -95,6 +104,11 @@ static void concurrency(void) {
     assert(pthread_join(second,NULL)==0 && b.result==0);
     assert(runtime_sema_waiters(id)==1);
     assert(signal_sem(id,2)==0);
+    assert(pthread_join(first,NULL)==0 && a.result==0);
+    /* The native Windows CV's infinite-wait path must wake without a timeout. */
+    a=(Task){id,1,99,0};
+    assert(pthread_create(&first,NULL,untimed_waiter,&a)==0); enrolled(id,1);
+    assert(signal_sem(id,1)==0);
     assert(pthread_join(first,NULL)==0 && a.result==0);
     assert(delete_sem(id)==0);
 }

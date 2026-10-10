@@ -20,10 +20,6 @@ static uint64_t capabilities;
 static _Atomic size_t guards_acquired, guards_released;
 static uint64_t stack_canary;
 static _Atomic size_t memory_calls;
-/* Dynamic TLS of linked modules: module IDs 2..7 (1 is the eboot's static TLS). */
-#define TLS_MODULES 8
-static struct { const void *data; uint64_t filesz, memsz; } tls_modules[TLS_MODULES];
-static _Thread_local unsigned char *tls_blocks[TLS_MODULES];
 static void *process_param;
 void runtime_set_procparam(void *param) {
     process_param=param;
@@ -49,24 +45,6 @@ static ABI void guest_set_heap_api(void **api) {
     puts("Runtime: application heap API registered");
 }
 void **runtime_application_heap_api(void) { return application_heap_api; }
-void runtime_set_module_tls(uint64_t module, const void *data, uint64_t filesz, uint64_t memsz) {
-    if (module<2 || module>=TLS_MODULES) { fputs("STOP: unsupported TLS module id\n",stderr); exit(21); }
-    tls_modules[module].data=data; tls_modules[module].filesz=filesz; tls_modules[module].memsz=memsz;
-}
-void runtime_set_libc_tls(const void *data, uint64_t filesz, uint64_t memsz) { runtime_set_module_tls(2,data,filesz,memsz); }
-static ABI void *guest_tls_get_addr(const uint64_t *index) {
-    if (!index || index[0]<2 || index[0]>=TLS_MODULES || !tls_modules[index[0]].data || index[1]>=tls_modules[index[0]].memsz) {
-        fputs("STOP: unsupported TLS module/offset\n",stderr); exit(21);
-    }
-    unsigned char **block=&tls_blocks[index[0]];
-    if (!*block) {
-        *block=calloc(1,tls_modules[index[0]].memsz);
-        if (!*block) { fputs("Cannot allocate module TLS\n",stderr); exit(1); }
-        memcpy(*block,tls_modules[index[0]].data,tls_modules[index[0]].filesz);
-    }
-    return *block+index[1];
-}
-
 void runtime_start(uint64_t flags) {
     capabilities = flags;
     if (!(flags & 1)) return;
@@ -225,7 +203,8 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     if (!strcmp(name, "+P6FRGH4LfA#q#q")) return (uintptr_t)guest_memmove;
     if (!strcmp(name, "DfivPArhucg#q#q")) return (uintptr_t)guest_memcmp;
     if (!strcmp(name, "j4ViWNHEgww#q#q")) return (uintptr_t)guest_strlen;
-    if (!strcmp(name, "vNe1w4diLCs#p#J")) return (uintptr_t)guest_tls_get_addr;
+    uintptr_t tls=runtime_tls_resolve(name);
+    if (tls) return tls;
     if (!strcmp(name, "959qrazPIrg#p#J")) return (uintptr_t)guest_procparam;
     if (!strcmp(name, "p5EcQeEeJAE#p#J")) return (uintptr_t)guest_set_heap_api;
     uintptr_t mutex = runtime_mutex_resolve(name);
@@ -259,25 +238,4 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     uintptr_t file = runtime_file_resolve(name);
     if (file) return file;
     return bbgpu_resolve(name);
-}
-static const struct { const char *nid, *symbol; } import_names[]={
-#include "import_names.inc"
-};
-/* Symbol name for a scoped NID, or NULL when this eboot/libc never imports it. */
-const char *runtime_symbol(const char *nid) {
-    for (size_t i=0;i<sizeof(import_names)/sizeof(*import_names);++i)
-        if (!strcmp(nid,import_names[i].nid)) return import_names[i].symbol;
-    return NULL;
-}
-/* Same symbol name means same contract whether imported from libkernel or
- * libScePosix, so newer modules resolve by name through runtime_symbol. */
-uintptr_t runtime_lookup(const RuntimeExport *table,size_t count,const char *nid) {
-    const char *symbol=runtime_symbol(nid);
-    if (!symbol) return 0;
-    for (size_t i=0;i<count;++i) if (!strcmp(symbol,table[i].name)) return (uintptr_t)table[i].function;
-    return 0;
-}
-const char *runtime_import_name(const char *name) {
-    const char *symbol=runtime_symbol(name);
-    return symbol ? symbol : "name not resolved; see analysis.json import_name_hints";
 }

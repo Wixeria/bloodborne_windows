@@ -67,6 +67,14 @@ public:
     /// (BB_DUMP_TRIGGER) for offline checks of the vectors.
     void PrintState(int frame) const;
 
+    struct FrameGenerationView {
+        std::array<float,12> inverse_view, previous_view;
+        std::array<float,4> projection, previous_projection;
+    };
+    [[nodiscard]] FrameGenerationView FrameGenerationCamera() const noexcept {
+        return {current.inv_view, previous.view, current.proj, previous.proj};
+    }
+
     /// Records the motion vector pass (Scheduler::Record): `depth_view` (depth aspect, General
     /// layout) into `motion_view` (RG16F storage, General), pixels, previous minus current.
     void RecordMotion(vk::ImageView depth_view, vk::ImageView motion_view, u32 width, u32 height);

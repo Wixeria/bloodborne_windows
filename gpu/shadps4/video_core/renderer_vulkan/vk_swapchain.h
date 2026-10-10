@@ -54,6 +54,8 @@ public:
         return swapchain;
     }
 
+    vk::PresentModeKHR GetPresentMode() const { return present_mode; }
+
     /// bbport: false while the window is minimised (0x0 surface): frames are not presented.
     bool IsPresentable() const {
         return !zero_extent && swapchain;

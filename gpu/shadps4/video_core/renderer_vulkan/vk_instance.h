@@ -317,6 +317,11 @@ public:
         return IsFsr4Int8Supported() && mixed_float_dot_product;
     }
 
+    /// bbport: the device extensions NVIDIA NGX (DLSS) needs are enabled.
+    bool IsDlssCapable() const {
+        return dlss_extensions;
+    }
+
     /// bbport: FSR 4.1.1's FP8 matrix variant (RDNA4): FP8 cooperative matrices, the Vulkan
     /// memory model, wave32 in full subgroups.
     bool IsFsr411Fp8Supported() const {
@@ -521,6 +526,12 @@ public:
     /// (VK_EXT_memory_budget: what this process can use now, other processes included).
     [[nodiscard]] u64 GetDeviceMemoryBudgetNow() const;
 
+    // bbport: one driver query, with device-local and host heaps kept separate.
+    struct MemorySnapshot {
+        u64 usage{}, budget{}, host_usage{}, host_budget{};
+    };
+    [[nodiscard]] MemorySnapshot GetMemorySnapshot() const;
+
     /// Returns the total memory budget available to the device.
     [[nodiscard]] u64 GetTotalMemoryBudget() const {
         return total_memory_budget;
@@ -610,6 +621,7 @@ private:
     bool shader_clock{};
     bool compute_shader_derivatives{};
     bool mixed_float_dot_product{}; // bbport: VK_VALVE_shader_mixed_float_dot_product (FSR 4.1.1)
+    bool dlss_extensions{};         // bbport: VK_NVX_binary_import + VK_NVX_image_view_handle
     bool cooperative_matrix{};      // bbport: VK_KHR_cooperative_matrix (FSR 4.1.1 FP8 variant)
     bool shader_float8{};           // bbport: VK_EXT_shader_float8 with FP8 matrices (RDNA4)
     bool supports_memory_budget{};

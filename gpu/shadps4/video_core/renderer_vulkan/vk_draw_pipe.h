@@ -198,7 +198,11 @@ private:
         Common::SetCurrentThreadName("bb:DrawRec");
         on_stage_b = true;
         BbSections::recording_thread = true;
+#ifdef _WIN32
+        stage_b_tid.store(GetCurrentThreadId(), std::memory_order_release);
+#else
         stage_b_tid.store(static_cast<u32>(gettid()), std::memory_order_release);
+#endif
         u64 at = 0;
         while (true) {
             // Packets follow each other within microseconds while a frame is decoded: spin,

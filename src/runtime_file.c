@@ -5,12 +5,16 @@
  * Paths containing ".." components are rejected rather than normalized. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "runtime_host_fs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #ifndef _WIN32
 #include <dirent.h>
+#else
+#include <windows.h>
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -35,51 +39,69 @@ typedef struct {
 _Static_assert(sizeof(GuestStat)==120,"FreeBSD stat layout");
 
 typedef struct { char *names; size_t count, *offsets; unsigned char *types; } Listing;
-/* commit: a save file opened for writing is written to a temporary copy (temp), which replaces
- * the file (commit) in one rename when closed: a crash or a kill mid-save leaves the old file. */
-typedef struct { int used, host, dirty; Listing *dir; size_t position; char path[512]; char *commit, *temp; } File;
-typedef struct { char guest[64]; char host[512]; } Mount;
+typedef struct { int used;
+#ifdef _WIN32
+    HANDLE host; int append;
+#else
+    int host;
+#endif
+    int dirty; char *commit, *temp;
+    Listing *dir; size_t position; char path[512]; } File;
+typedef struct { char guest[64]; char host[512]; int readonly; } Mount;
 static File files[MAX_FILES];
 static Mount mounts[MAX_MOUNTS];
 static size_t mount_count, opens, reads, writes, missing;
 static uint64_t bytes_read;
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
-
 static int save_path(const char *p) { return p && !strncmp(p,"/savedata",9); }
-static int temp_name(const char *name) {
-    size_t n=strlen(name);
-    return n>6 && !strcmp(name+n-6,".bbtmp");
-}
-/* Copies left by a crash (none of them open): removed when their directory is mounted. */
-static void remove_stale_temps(const char *dir,int depth) {
-    DIR *d=opendir(dir);
-    if (!d) return;
-    for (struct dirent *e; (e=readdir(d));) {
-        if (e->d_name[0]=='.') continue;
-        char path[1024];
-        if ((size_t)snprintf(path,sizeof(path),"%s/%s",dir,e->d_name)>=sizeof(path)) continue;
-        if (temp_name(e->d_name)) {
+static int temp_name(const char *name) { size_t n=strlen(name); return n>6 && !strcmp(name+n-6,".bbtmp"); }
+static void remove_stale_temps(const char *path,int depth) {
+    RuntimeHostDirectory *d=runtime_host_opendir(path);
+    for (const RuntimeHostEntry *e; d && (e=runtime_host_readdir(d));) {
+        if (e->name[0]=='.') continue;
+        char child[2048]; int n=snprintf(child,sizeof(child),"%s/%s",path,e->name);
+        if (n<0 || (size_t)n>=sizeof(child)) continue;
+        if (temp_name(e->name) && !e->directory) {
             int open_now=0;
-            for (int i=3;i<MAX_FILES;++i) if (files[i].used && files[i].temp && !strcmp(files[i].temp,path)) open_now=1;
-            if (!open_now && !unlink(path)) printf("Runtime: removed %s (a save interrupted earlier; the file it would have replaced is intact)\n",path);
-        } else if (depth<4 && e->d_type==DT_DIR) remove_stale_temps(path,depth+1);
+            for (int i=3;i<MAX_FILES;++i) if (files[i].used && files[i].temp && !strcmp(files[i].temp,child)) open_now=1;
+            if (!open_now) runtime_host_unlink(child);
+        } else if (depth<4 && e->directory) remove_stale_temps(child,depth+1);
     }
-    closedir(d);
+    if (d) runtime_host_closedir(d);
 }
 
-int runtime_file_mount(const char *guest,const char *host) {
+int runtime_file_mount_mode(const char *guest,const char *host,int readonly) {
+    if (!guest || !host || !*guest || !*host || strlen(guest)>=64 || strlen(host)>=512) return -1;
     pthread_mutex_lock(&lock);
     for (size_t i=0;i<mount_count;++i) if (!strcmp(mounts[i].guest,guest)) {
         snprintf(mounts[i].host,sizeof(mounts[i].host),"%s",host);
+        mounts[i].readonly=!!readonly;
         pthread_mutex_unlock(&lock); return 0;
     }
     if (mount_count==MAX_MOUNTS || strlen(guest)>=64 || strlen(host)>=512) { pthread_mutex_unlock(&lock); return -1; }
     snprintf(mounts[mount_count].guest,64,"%s",guest);
     snprintf(mounts[mount_count].host,512,"%s",host);
+    mounts[mount_count].readonly=!!readonly;
     ++mount_count;
     if (save_path(guest)) remove_stale_temps(host,0);
     pthread_mutex_unlock(&lock);
     return 0;
+}
+int runtime_file_mount(const char *guest,const char *host) { return runtime_file_mount_mode(guest,host,0); }
+static int readonly_path(const char *path) {
+    if (!path || !*path) return 0;
+    if (*path!='/') return 1;
+    int result=(!strncmp(path,"/app0",5) && (!path[5] || path[5]=='/')) ||
+               (!strncmp(path,"/hostapp",8) && (!path[8] || path[8]=='/'));
+    pthread_mutex_lock(&lock);
+    size_t best=0;
+    for (size_t i=0;i<mount_count;++i) {
+        size_t n=strlen(mounts[i].guest);
+        if (n>best && !strncmp(path,mounts[i].guest,n) && (!path[n] || path[n]=='/')) {
+            best=n; result=mounts[i].readonly;
+        }
+    }
+    pthread_mutex_unlock(&lock); return result;
 }
 void runtime_file_unmount(const char *guest) {
     pthread_mutex_lock(&lock);
@@ -93,13 +115,22 @@ const char *runtime_file_user_dir(void) { return user_root; }
 void runtime_file_configure(const char *app0,const char *user) {
     char path[600];
     snprintf(user_root,sizeof(user_root),"%s",user);
-    runtime_file_mount("/app0",app0);
-    runtime_file_mount("/hostapp",app0);
+    runtime_file_mount_mode("/app0",app0,1);
+    runtime_file_mount_mode("/hostapp",app0,1);
     const char *writable[]={"temp0","download0","data"};
+#ifdef _WIN32
+    wchar_t wide[1024];
+    if (MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,user,-1,wide,1024)) CreateDirectoryW(wide,NULL);
+#else
     mkdir(user,0755);
+#endif
     for (int i=0;i<3;++i) {
         snprintf(path,sizeof(path),"%s/%s",user,writable[i]);
+#ifdef _WIN32
+        if (MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,path,-1,wide,1024)) CreateDirectoryW(wide,NULL);
+#else
         mkdir(path,0755);
+#endif
         char guest[32]; snprintf(guest,sizeof(guest),"/%s",writable[i]);
         runtime_file_mount(guest,path);
     }
@@ -107,6 +138,15 @@ void runtime_file_configure(const char *app0,const char *user) {
 /* Resolve a guest path to a host path; returns 0 or a host errno. */
 static int translate(const char *guest,char *out,size_t size) {
     if (!guest || !*guest) return ENOENT;
+    if (!out || !size) return EINVAL;
+    if (strlen(guest)>=sizeof(char[1024])-7) return ENAMETOOLONG;
+#ifdef _WIN32
+    /* Guest paths use '/', never host drive names, streams or backslash traversal. */
+    if (strpbrk(guest,"\\:*?\"<>|")) return EACCES;
+    for (const char *p=guest;*p;++p)
+        if ((unsigned char)*p<32 || ((*p==' ' || *p=='.') && (!p[1] || p[1]=='/') &&
+            !(p[0]=='.' && (p==guest || p[-1]=='/')))) return EACCES;
+#endif
     char buffer[1024];
     if (guest[0]!='/') snprintf(buffer,sizeof(buffer),"/app0/%s",guest);
     else snprintf(buffer,sizeof(buffer),"%s",guest);
@@ -129,38 +169,9 @@ static int translate(const char *guest,char *out,size_t size) {
     if (trace) printf("File trace: %s -> %s\n",guest,result ? "(no mount)" : out);
     return result;
 }
-/* The PS4's file system ignores case, and the game asks for lower-case names
- * (adhoc/font/dbgfont14h.ccm): files from mods or dumps made elsewhere keep their own case.
- * After a miss, the host path is matched component by component ignoring case; true when it was
- * corrected (same length: only case differs). Only on misses: no cost for found files. */
-static int fix_case(char *path) {
-    if (path[0]!='/') return 0;
-    char out[1024]="", trial[1024], part[256];
-    const char *p=path;
-    while (*p) {
-        while (*p=='/') ++p;
-        if (!*p) break;
-        const char *end=strchr(p,'/');
-        size_t len=end ? (size_t)(end-p) : strlen(p);
-        if (len>=sizeof(part)) return 0;
-        memcpy(part,p,len); part[len]=0;
-        if ((size_t)snprintf(trial,sizeof(trial),"%s/%s",out,part)>=sizeof(trial)) return 0;
-        if (access(trial,F_OK)) {
-            DIR *d=opendir(out[0] ? out : "/");
-            if (!d) return 0;
-            int found=0;
-            for (struct dirent *e;(e=readdir(d));)
-                if (!strcasecmp(e->d_name,part)) { snprintf(trial,sizeof(trial),"%s/%s",out,e->d_name); found=1; break; }
-            closedir(d);
-            if (!found) return 0;
-        }
-        memcpy(out,trial,strlen(trial)+1);
-        p+=len;
-    }
-    if (!strcmp(out,path) || strlen(out)!=strlen(path)) return 0;
-    memcpy(path,out,strlen(out)+1);
-    return 1;
-}
+#ifdef _WIN32
+#include "runtime_file_windows.h"
+#else
 static int host_flags(int flags) {
     int r;
     switch (flags&3) { case 0: r=O_RDONLY; break; case 1: r=O_WRONLY; break; default: r=O_RDWR; }
@@ -223,13 +234,7 @@ static int audio_trace(void) { static int v=-1; if (v<0) { const char *e=getenv(
 /* BB_SAVE_TRACE=1: every operation on save files (/savedataN). */
 static int save_trace(void) { static int v=-1; if (v<0) { const char *e=getenv("BB_SAVE_TRACE"); v=e && e[0]=='1'; } return v; }
 /* Game mounts (including linked mod overlays) are read-only. Saves use other mounts. */
-static int game_path(const char *p) {
-    if (!p || !*p) return 0;
-    if (*p!='/') return 1;
-    return (!strncmp(p,"/app0",5) && (!p[5] || p[5]=='/')) ||
-           (!strncmp(p,"/hostapp",8) && (!p[8] || p[8]=='/'));
-}
-/* Saves (/savedataN): see File. The copy starts as the old file unless the open truncates. */
+static int game_path(const char *p) { return readonly_path(p); }
 static unsigned temp_serial;
 static int copy_contents(int from,int to) {
     char buffer[65536];
@@ -568,6 +573,8 @@ static int64_t do_access(const char *guest,int mode) {
     return r;
 }
 
+#endif
+
 /* Convention adapters: sceKernel* -> Orbis error codes, POSIX -> -1 + errno. */
 static int64_t sce(int64_t r) { return r<0 ? ERR(runtime_guest_errno((int)-r)) : r; }
 static int64_t posix(int64_t r) { if (r<0) { *runtime_errno()=runtime_guest_errno((int)-r); return -1; } return r; }
@@ -635,8 +642,3 @@ void runtime_file_report(void) {
     printf("Runtime: files opened=%zu, reads=%zu (%llu bytes), writes=%zu, not found=%zu\n",
            opens,reads,(unsigned long long)bytes_read,writes,missing);
 }
-#else
-uintptr_t runtime_file_resolve(const char *name) { (void)name; return 0; }
-void runtime_file_report(void) {}
-void runtime_file_configure(const char *a,const char *u) { (void)a; (void)u; }
-#endif

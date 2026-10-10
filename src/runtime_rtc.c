@@ -70,8 +70,21 @@ static uint64_t now_utc(void) {
 static int64_t local_offset(uint64_t utc) {
     time_t seconds=(time_t)((int64_t)(utc-UNIX_EPOCH_TICKS)/1000000);
     struct tm local;
+#ifdef _WIN32
+    localtime_s(&local,&seconds);
+#else
     localtime_r(&seconds,&local);
+#endif
+#ifdef _WIN32
+    /* Interpret the UTC broken-down date as local time; mktime accounts for DST
+       at this date rather than applying today's bias to historical timestamps. */
+    struct tm utc_tm;
+    gmtime_s(&utc_tm,&seconds);
+    utc_tm.tm_isdst=local.tm_isdst;
+    return (int64_t)difftime(seconds,mktime(&utc_tm))*1000000;
+#else
     return (int64_t)local.tm_gmtoff*1000000;
+#endif
 }
 
 static ABI int32_t rtc_current_local(DateTime *t) {

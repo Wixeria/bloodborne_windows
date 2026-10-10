@@ -1,35 +1,33 @@
 THIS PROJECT IS NOT RELATED TO SHADPS4. ALL QUESTIONS RELATED TO THIS PROJECT SHOULD BE SENT TO THE DISCORD SERVER https://discord.gg/KYZRKk9CB, NOT TO THE SHADPS4 SERVER.
 
+# Bloodborne PC - bbport for Windows and Linux
 
-# bbport — a native Linux port of Bloodborne
+**English** | [Russian](README.ru.md)
 
-**English** · [Русский](README.ru.md)
+This fork adds an experimental Windows port to [bbport upstream 0.5](https://github.com/deadinside28/bloodborne_pc/releases/tag/0.5), a native PC port for one game: *Bloodborne* (CUSA03173, version 1.09). It is not a general-purpose emulator. The original x86-64 game code runs natively; a game-specific runtime replaces the PS4 system libraries, while a Vulkan renderer derived from [shadPS4](https://github.com/shadps4-emu/shadPS4) handles graphics.
 
-bbport is the counterpart of Wine + DXVK for a single game: *Bloodborne* for PlayStation 4
-(CUSA03173, game version 1.09) on an x86-64 Linux PC. The game's original executable runs
-directly on the PC:
+> **No game files are included.** Use your own decrypted CUSA03173 v1.09 dump. This project is not affiliated with Sony Interactive Entertainment or FromSoftware.
 
-- **as in Wine**, the game's x86-64 code runs on the CPU directly, and a runtime written for
-  this one game replaces the PS4 system libraries;
-- **as in DXVK**, the game's graphics are translated to Vulkan — by a renderer derived from
-  [shadPS4](https://github.com/shadps4-emu/shadPS4) and heavily extended for this game, including
-  temporal upscaling with AMD FSR 3.1, FSR 4 and FSR 4.1.1;
-- memory and the GPU's work follow the PC model on AMD GPUs by default (the new memory and
-  translation model); NVIDIA and other GPUs keep the old memory model of 0.3 for now. The
-  launcher's *Memory model* switches either way.
+**Status:** the Windows port is experimental. Boot, character creation, movement, camera control, and save/reload have been verified in early-game areas on one Windows/NVIDIA system. Full completion, extended sessions, and broad hardware support have not been verified. The Linux port remains available with the upstream requirements below.
 
-One step remains to the full Wine + DXVK model: the new model on NVIDIA as well, then removing the
-old memory model (see below).
+## Windows port
 
-> **No game files are included.** You need your own dump of Bloodborne (CUSA03173, v1.09).
-> This project is not affiliated with Sony Interactive Entertainment, FromSoftware or AMD.
+This fork adds an experimental native Windows build and launcher to the upstream 0.5 release. It runs the original x86-64 game code with a game-specific runtime and a Vulkan renderer based on shadPS4. Linux remains supported through the upstream path below.
 
-**Status: experimental, playable.** The game boots, loads saves and plays (the Hunter's Dream
-and several areas of Yharnam were played with it) with sound, gamepad and saving.
-A full play-through has not been verified, and only one machine (Linux, AMD Radeon RX 7800 XT,
-Mesa/RADV) has been tested thoroughly.
+Windows 10 x64 (version 1803 or newer), a Vulkan-capable GPU, and your own decrypted CUSA03173 game files updated to version 1.09 are required. No game files or saves are included. The current Windows test coverage verifies boot, character creation, movement, camera control, and save/reload in early areas; a full play-through and broad hardware coverage are not verified.
 
-## Highlights
+Start `launcher-windows.cmd` to open the Rust/GPUI Kit launcher. It configures graphics, window mode, controller and keyboard/mouse bindings, mods, and optional NVIDIA Frame Generation. The Insert overlay exposes in-game settings. Frame Generation is experimental and off by default. For launcher setup, game preparation, logs, and tested limitations, see the [Windows port guide](docs/WINDOWS_PORT.md) and [launcher guide](docs/WINDOWS_LAUNCHER.md).
+
+To build and run from PowerShell:
+
+```powershell
+.\build-windows.ps1 -Bootstrap -Gpu -Jobs 3 -Test -TestVulkan
+.\run-windows.ps1 -Gpu -GameDirectory 'D:\Games\CUSA03173' -PatchDirectory 'D:\Games\CUSA03173-patch' -SkipBuild -Timeout 0
+```
+
+Omit `-PatchDirectory` when the game folder already contains the complete 1.09 update. See [Windows keyboard and controller controls](docs/WINDOWS_INPUT.md), [mods](docs/WINDOWS_MODS.md), [performance notes](docs/WINDOWS_PERFORMANCE.md), and [Frame Generation limitations](docs/WINDOWS_FRAME_GENERATION.md).
+
+## Linux port highlights
 
 - **Native execution.** The eboot is converted offline into a flat memory image; PS4 libc and
   libSceFios2 are linked into it as native code. No CPU emulation and no per-instruction
@@ -132,7 +130,7 @@ the graphics side.
 "Port" here means a build for this one game, not a rewrite of its source code, which the project
 neither has nor includes.
 
-## Requirements
+## Linux upstream requirements
 
 - Linux x86-64, a Vulkan 1.3 GPU. Tested: AMD RX 7800 XT with Mesa 26 (RADV).
   The *New memory and translation model* mode is not tested on NVIDIA yet.
@@ -147,7 +145,7 @@ neither has nor includes.
 - To build: GCC, CMake, Ninja, Python 3, glslang, SDL3, Vulkan headers and the libraries in
   `shell.nix`. With [Nix](https://nixos.org) everything comes from `shell.nix` automatically.
 
-## Build and run
+## Build and run (Linux)
 
 ```bash
 git clone --recursive https://github.com/deadinside28/bloodborne_pc.git bbport && cd bbport

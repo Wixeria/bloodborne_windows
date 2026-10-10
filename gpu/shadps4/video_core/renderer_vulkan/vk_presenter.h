@@ -12,6 +12,7 @@
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
 #include "video_core/renderer_vulkan/host_passes/pp_pass.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
@@ -36,6 +37,8 @@ struct Frame {
     vk::Fence present_done;
     vk::Semaphore ready_semaphore;
     u64 ready_tick;
+    std::shared_ptr<DlssgInput> fg_input;
+    std::shared_ptr<DlssgFrame> reflex_timing;
     bool is_hdr{false};
     u8 id{};
 
@@ -78,7 +81,11 @@ public:
         if (!IsHDRSupported()) {
             return;
         }
-        swapchain.SetHDR(enable);
+        if (swapchain.GetHDR() != enable) {
+            std::scoped_lock submit_lock{Scheduler::submit_mutex};
+            Dlssg::Drain(instance);
+            swapchain.SetHDR(enable);
+        }
         pp_settings.hdr = enable ? 1 : 0;
     }
 
@@ -119,6 +126,7 @@ private:
     Frontend::WindowSDL& window;
     Instance instance;
     HostPasses::FsrPass fsr_pass;
+    std::unique_ptr<HostPasses::FsrPass> fg_fsr_pass;
     HostPasses::FsrPass::Settings fsr_settings{};
     HostPasses::PostProcessingPass::Settings pp_settings{};
     HostPasses::PostProcessingPass pp_pass;

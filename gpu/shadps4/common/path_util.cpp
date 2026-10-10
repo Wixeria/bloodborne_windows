@@ -7,6 +7,10 @@
 #include "common/path_util.h"
 #include "common/scope_exit.h"
 #include "common/types.h"
+#ifdef _WIN32
+#include <windows.h>
+#include <Shlobj.h>
+#endif
 
 #ifdef __APPLE__
 #include <CoreFoundation/CFBundle.h>
@@ -87,8 +91,9 @@ static std::optional<std::filesystem::path> GetBundleParentDirectory() {
 static auto UserPaths = [] {
     // bbport: the port keeps GPU caches where BB_GPU_USER_DIR points.
     const char* port_dir = std::getenv("BB_GPU_USER_DIR");
-    auto user_dir = port_dir ? std::filesystem::path(port_dir) : std::filesystem::current_path() / PORTABLE_DIR;
-    if (!std::filesystem::exists(user_dir)) {
+    const bool configured = port_dir && port_dir[0];
+    auto user_dir = configured ? std::filesystem::u8path(port_dir) : std::filesystem::current_path() / PORTABLE_DIR;
+    if (!configured && !std::filesystem::exists(user_dir)) {
         // If it doesn't exist, use the standard path for the platform instead.
         // NOTE: On Windows we currently just create the portable directory instead.
 #ifdef __APPLE__
@@ -111,7 +116,7 @@ static auto UserPaths = [] {
     std::unordered_map<PathType, fs::path> paths;
 
     const auto create_path = [&](PathType shad_path, const fs::path& new_path) {
-        std::filesystem::create_directory(new_path);
+        std::filesystem::create_directories(new_path);
         paths.insert_or_assign(shad_path, new_path);
     };
 

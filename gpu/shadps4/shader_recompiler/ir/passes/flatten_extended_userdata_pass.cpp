@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
 #include <unordered_map>
 #include <boost/container/flat_map.hpp>
 #include <queue>
@@ -30,9 +31,15 @@ using namespace Xbyak::util;
 static Xbyak::CodeGenerator g_srt_codegen(32_MB);
 static const u8* g_srt_codegen_start = nullptr;
 
+namespace {
+void EnsureSrtFaultHandler();
+}
+
 namespace Shader {
 
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
+    // Cached walkers need the same recovery handler as generated walkers (PR #6).
+    EnsureSrtFaultHandler();
     const auto func_addr = (PFN_SrtWalker)g_srt_codegen.getCurr();
     g_srt_codegen.db(ptr, size);
     g_srt_codegen.ready();
@@ -77,6 +84,16 @@ static bool SrtWalkerSignalHandler(void* context, void* fault_address) {
         return false; // Not in SRT code range
     }
 
+    // Two workers may have faulted before either patched the same instruction.
+    // Serialize decoding/patching and retry an already patched instruction.
+    static std::mutex patch_mutex;
+    std::scoped_lock patch_lock{patch_mutex};
+    const auto* bytes = reinterpret_cast<const u8*>(code);
+    if ((bytes[0] == 0x48 && bytes[1] == 0x31 && bytes[2] == 0xFF) ||
+        (bytes[0] == 0x45 && bytes[1] == 0x31 && bytes[2] == 0xD2)) {
+        return true;
+    }
+
     // Patch instruction to zero register
     ZydisDecodedInstruction instruction;
     ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
@@ -118,6 +135,15 @@ static bool SrtWalkerSignalHandler(void* context, void* fault_address) {
                 fault_address);
 
     return true;
+}
+
+void EnsureSrtFaultHandler() {
+    static std::once_flag registered;
+    std::call_once(registered, [] {
+        // Cached code can precede newly generated code in the same buffer.
+        g_srt_codegen_start = g_srt_codegen.getCode();
+        Core::Signals::Instance()->RegisterAccessViolationHandler(SrtWalkerSignalHandler, 2);
+    });
 }
 
 using namespace Shader;
@@ -641,13 +667,7 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
     }
 
     // Register the signal handler for SRT walker, if not already registered
-    if (g_srt_codegen_start == nullptr) {
-        g_srt_codegen_start = c.getCurr();
-        auto* signals = Core::Signals::Instance();
-        // Call after the memory invalidation handler
-        constexpr u32 priority = 2;
-        signals->RegisterAccessViolationHandler(SrtWalkerSignalHandler, priority);
-    }
+    EnsureSrtFaultHandler();
 
     info.srt_info.walker_func = c.getCurr<PFN_SrtWalker>();
     pass_info.dst_off_dw = NUM_USER_DATA_REGS;

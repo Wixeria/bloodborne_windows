@@ -40,6 +40,9 @@ elseif (BB_PGO STREQUAL "use")
                         -fprofile-correction -Wno-missing-profile -Wno-coverage-mismatch)
 endif()
 
+if(WIN32)
+    include(cmake/WindowsDependencies.cmake)
+else()
 find_package(Vulkan REQUIRED)
 find_package(fmt REQUIRED)
 find_package(Boost REQUIRED)
@@ -53,6 +56,7 @@ pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
 find_package(miniz REQUIRED)
 find_package(Zydis REQUIRED)
 find_program(GLSLANG_COMPILER NAMES glslang glslangValidator REQUIRED)
+endif()
 
 set(SIRIT_USE_SYSTEM_SPIRV_HEADERS OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/sirit EXCLUDE_FROM_ALL)
@@ -61,6 +65,16 @@ add_subdirectory(third_party/sirit EXCLUDE_FROM_ALL)
 set(FFX_VK_PORTABLE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(FFX_VK_PORTABLE_BUILD_PROBE OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/fsr-vulkan EXCLUDE_FROM_ALL)
+if(MINGW)
+    foreach(target ffx_vulkan_fsr3_host_1_1_4 ffx_vulkan_fsr3_vk_backend_1_1_4
+        ffx_vulkan_fsr3_host_3_1_5_scaffold ffx_vulkan_fsr3_sdk_core_3_1_5_scaffold
+        ffx_vulkan_fsr3_framegeneration_3_1_6_scaffold ffx_vulkan_fsr3_vk_backend_3_1_5
+        ffx_vulkan_fsr3_vk_framegeneration_3_1_6)
+        if(TARGET ${target})
+            target_compile_options(${target} PRIVATE "SHELL:-include \"${CMAKE_CURRENT_SOURCE_DIR}/shim/bbport_fsr_mingw.h\"")
+        endif()
+    endforeach()
+endif()
 
 # Host shaders -> headers (same scheme as shadPS4's host_shaders/CMakeLists.txt).
 set(SHADER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/host_shaders)
@@ -88,6 +102,7 @@ add_host_shader(fsr.comp fsr_easu_comp SAMPLE_EASU=1)
 add_host_shader(fsr.comp fsr_rcas_comp SAMPLE_RCAS=1)
 add_host_shader(post_process.frag post_process_frag)
 add_host_shader(camera_motion.comp camera_motion_comp)
+add_host_shader(dlssg_snapshot.comp dlssg_snapshot_comp)
 add_host_shader(upscale_merge.comp upscale_merge_comp)
 add_host_shader(upscale_reactive.comp upscale_reactive_comp)
 add_host_shader(taa.comp taa_comp)
@@ -119,8 +134,13 @@ set(COMMON
     shadps4/common/path_util.cpp shadps4/common/rdtsc.cpp shadps4/common/spin_lock.cpp shadps4/common/recursive_lock.cpp
     shadps4/common/string_util.cpp shadps4/common/thread.cpp shadps4/common/signal_context.cpp
     shim/common/logging/log.cpp)
+if(WIN32)
+    list(APPEND COMMON shadps4/common/ntapi.cpp)
+endif()
 file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
+if(NOT WIN32)
+    pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
+endif()
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp)
 # The layer's own modules (independent of the shadPS4 code): layer/.
 file(GLOB LAYER_SOURCES CONFIGURE_DEPENDS layer/*.cpp)
@@ -128,12 +148,38 @@ file(GLOB LAYER_SOURCES CONFIGURE_DEPENDS layer/*.cpp)
 file(GLOB GAME_SOURCES CONFIGURE_DEPENDS games/*.cpp)
 # The translator's own command processor (docs/TRANSLATOR_ARCHITECTURE.ru.md, step 2): cp/.
 file(GLOB CP_SOURCES CONFIGURE_DEPENDS cp/*.cpp)
-add_library(bbgpu SHARED ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES} ${LAYER_SOURCES} ${GAME_SOURCES} ${CP_SOURCES}
+if(WIN32)
+    set(BB_GPU_LIBRARY_TYPE STATIC) # PE cannot defer unresolved runtime symbols to the EXE.
+else()
+    set(BB_GPU_LIBRARY_TYPE SHARED)
+endif()
+add_library(bbgpu ${BB_GPU_LIBRARY_TYPE} ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES} ${LAYER_SOURCES} ${GAME_SOURCES} ${CP_SOURCES}
     shadps4/core/libraries/gnmdriver/gnmdriver.cpp
     shadps4/core/libraries/videoout/driver.cpp shadps4/core/libraries/videoout/video_out.cpp
     shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER}
     shadps4/core/libraries/videodec/video_utils.cpp)
 add_dependencies(bbgpu host_shaders)
+set(BB_STREAMLINE_HEADERS "" CACHE PATH "Optional Streamline SDK include directory (Windows FG experiment)")
+if(BB_STREAMLINE_HEADERS)
+    if(NOT WIN32 OR NOT EXISTS "${BB_STREAMLINE_HEADERS}/sl_dlss_g.h")
+        message(FATAL_ERROR "Windows frame generation requires Streamline SDK headers")
+    endif()
+    target_include_directories(bbgpu SYSTEM PRIVATE "${BB_STREAMLINE_HEADERS}")
+    target_compile_definitions(bbgpu PRIVATE BB_HAS_STREAMLINE=1)
+    target_link_libraries(bbgpu PUBLIC wintrust crypt32 bcrypt)
+    # SDK 2.14.1 sl_pcl.h has an invalid C++23 using-alias for std::to_underlying.
+    # Its supported C++20 branch works without modifying downloaded SDK headers.
+    set_source_files_properties(shadps4/video_core/renderer_vulkan/vk_dlssg.cpp
+        PROPERTIES SKIP_PRECOMPILE_HEADERS ON COMPILE_OPTIONS "-std=c++20")
+    if(BUILD_TESTING)
+        add_executable(dlssg-camera-test ../tests/test_dlssg_camera.cpp)
+        set_target_properties(dlssg-camera-test PROPERTIES CXX_STANDARD 20)
+        target_include_directories(dlssg-camera-test PRIVATE shadps4)
+        target_include_directories(dlssg-camera-test SYSTEM PRIVATE "${BB_STREAMLINE_HEADERS}")
+        target_compile_options(dlssg-camera-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+        add_test(NAME dlssg-camera-constants COMMAND dlssg-camera-test)
+    endif()
+endif()
 # In-game settings menu: Dear ImGui (third_party/imgui, MIT) with its Vulkan backend, and an
 # embedded Cyrillic font (third_party/fonts).
 target_sources(bbgpu PRIVATE third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
@@ -157,12 +203,57 @@ target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
 # Loaded with bb-probe at startup (DT_NEEDED, never dlopen): thread_local access without a
 # TLS descriptor call (_dl_tlsdesc_return was ~2% of the draw recording thread).
-target_compile_options(bbgpu PRIVATE -ftls-model=initial-exec)
+if(NOT WIN32)
+    target_compile_options(bbgpu PRIVATE -ftls-model=initial-exec)
+endif()
 # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe.
-target_link_options(bbgpu PRIVATE -Wl,--allow-shlib-undefined)
+if(NOT WIN32)
+    target_link_options(bbgpu PRIVATE -Wl,--allow-shlib-undefined)
+endif()
 target_link_libraries(bbgpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan)
 target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
-    tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::X11 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
+    tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
+
+# Portable 0.5 memory bookkeeping; renderer bindings are integrated separately.
+add_library(bb-layer-memory STATIC layer/bblayer_gpu_memory.cpp)
+target_compile_features(bb-layer-memory PUBLIC cxx_std_20)
+target_include_directories(bb-layer-memory PUBLIC layer)
+target_link_libraries(bb-layer-memory PUBLIC Vulkan::Headers)
+if(BUILD_TESTING)
+    add_executable(layer-gpu-memory-test ../tests/test_layer_gpu_memory.cpp)
+    target_link_libraries(layer-gpu-memory-test PRIVATE bb-layer-memory)
+    target_compile_options(layer-gpu-memory-test PRIVATE -UNDEBUG)
+    add_test(NAME gpu-layer-memory COMMAND layer-gpu-memory-test)
+    add_executable(signal-dispatch-test ../tests/test_signal_dispatch.cpp)
+    target_compile_features(signal-dispatch-test PRIVATE cxx_std_20)
+    target_include_directories(signal-dispatch-test PRIVATE shim shadps4)
+    target_compile_options(signal-dispatch-test PRIVATE -UNDEBUG)
+    add_test(NAME gpu-signal-dispatch COMMAND signal-dispatch-test)
+endif()
+if(WIN32)
+    add_executable(bb-host-import-probe EXCLUDE_FROM_ALL ../tools/windows/host_import_probe.c)
+    target_link_libraries(bb-host-import-probe PRIVATE Vulkan::Vulkan bb-runtime-memory)
+    target_compile_options(bb-host-import-probe PRIVATE -Wall -Wextra -Werror)
+endif()
+if(WIN32)
+    target_link_libraries(bbgpu PUBLIC ws2_32 shell32 ntdll)
+    # Vulkan-Hpp's dynamic dispatcher layout depends on its platform macros.
+    # Consumers that call Vulkan directly must use the same layout as bbgpu.
+    target_compile_definitions(bbgpu PUBLIC VK_USE_PLATFORM_WIN32_KHR NOMINMAX WIN32_LEAN_AND_MEAN)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        # Keep source lines for fault diagnosis without emitting every template's
+        # full debug type graph; this substantially reduces native build memory.
+        target_compile_options(bbgpu PRIVATE -gline-tables-only)
+    endif()
+    target_precompile_headers(bbgpu PRIVATE <algorithm> <array> <atomic> <memory>
+        <mutex> <span> <vector> <fmt/format.h>
+        "${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_vulkan/vk_common.h")
+    # This standalone FSR provider calls exported C Vulkan functions directly.
+    set_source_files_properties(shadps4/video_core/renderer_vulkan/fsr411/fsr411.cpp
+        PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+else()
+    target_link_libraries(bbgpu PUBLIC PkgConfig::X11)
+endif()
 
 # Explicit test targets; neither launches the game nor needs a Vulkan device.
 add_executable(motion-history-test EXCLUDE_FROM_ALL ../tests/test_motion_history.cpp)
@@ -180,6 +271,12 @@ target_include_directories(cp-decoder-test PRIVATE cp)
 add_executable(settings-test EXCLUDE_FROM_ALL ../tests/test_settings.cpp shim/bbport_settings.cpp)
 target_compile_options(settings-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(settings-test PRIVATE .. shim)
+target_link_libraries(settings-test PRIVATE SDL3::SDL3)
+if(BUILD_TESTING)
+    set_target_properties(settings-test PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME gpu-settings-preservation COMMAND settings-test)
+    set_tests_properties(gpu-settings-preservation PROPERTIES TIMEOUT 20)
+endif()
 
 add_executable(scene-resolution-test EXCLUDE_FROM_ALL ../tests/test_scene_resolution.cpp ../tests/test_gpu_runtime_stubs.cpp)
 target_include_directories(scene-resolution-test PRIVATE shim shadps4 third_party/gcn/include)
@@ -211,10 +308,19 @@ set_source_files_properties(../tests/test_translation_memory.cpp PROPERTIES
     COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
 target_link_libraries(translation-memory-test PRIVATE bbgpu)
 
+if(WIN32)
+    # These headless tests use runtime stubs instead of bb-runtime; supply the
+    # host libraries required by the Windows static renderer explicitly.
+    foreach(gpu_test motion-shader-test scene-resolution-test taa-shader-test camera-motion-test translation-memory-test)
+        target_link_libraries(${gpu_test} PRIVATE Threads::Threads mincore)
+    endforeach()
+endif()
+
 # bbport: FSR 4 benchmark outside the game (tools/fsr4_bench.cpp): ninja -C out/gpu fsr4-bench.
 add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_support.cpp
     shim/bbport_settings.cpp)
 target_include_directories(upscaler-support-test PRIVATE shim)
+target_link_libraries(upscaler-support-test PRIVATE SDL3::SDL3)
 target_compile_options(upscaler-support-test PRIVATE -UNDEBUG)
 
 add_executable(fsr4-bench EXCLUDE_FROM_ALL tools/fsr4_bench.cpp

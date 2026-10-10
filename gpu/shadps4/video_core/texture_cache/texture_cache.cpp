@@ -18,6 +18,7 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/host_compatibility.h"
+#include "video_core/texture_cache/memory_budget.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
 
@@ -177,11 +178,16 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     }
 }
 
+u64 TextureCache::MaybeDirtyHash(const Image& image) {
+    // Use the same range when marking and refreshing (PR #6). MaybeCpuDirty
+    // images fit within the invalidated page; writes past the first pixels matter.
+    return XXH3_64bits(std::bit_cast<const u8*>(image.info.guest_address), image.info.guest_size);
+}
+
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
     if (image.hash == 0) {
         // Initialize hash
-        const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
-        image.hash = XXH3_64bits(addr, image.info.guest_size);
+        image.hash = MaybeDirtyHash(image);
     }
     image.flags |= ImageFlagBits::MaybeCpuDirty;
     UntrackImage(image_id);
@@ -877,17 +883,7 @@ void TextureCache::RefreshImage(Image& image) {
 
     if (True(image.flags & ImageFlagBits::MaybeCpuDirty) &&
         False(image.flags & ImageFlagBits::CpuDirty)) {
-        // The image size should be less than page size to be considered MaybeCpuDirty
-        // So this calculation should be very uncommon and reasonably fast
-        // For now we'll just check up to 64 first pixels
-        const auto addr = std::bit_cast<u8*>(image.info.guest_address);
-        const u32 w = std::min(image.info.size.width, u32(8));
-        const u32 h = std::min(image.info.size.height, u32(8));
-
-        const u32 s_w = image.info.props.is_block ? Common::DivCeil(w, 4u) : w;
-        const u32 s_h = image.info.props.is_block ? Common::DivCeil(h, 4u) : h;
-        const u32 size = s_w * s_h * (image.info.num_bits / 8);
-        const u64 hash = XXH3_64bits(addr, size);
+        const u64 hash = MaybeDirtyHash(image);
         if (image.hash == hash) {
             image.flags &= ~ImageFlagBits::MaybeCpuDirty;
             return;
@@ -943,7 +939,8 @@ void TextureCache::RefreshImage(Image& image) {
             window_start = now;
         }
     }
-    BbStats::image_upload_bytes.fetch_add(image.info.guest_size, std::memory_order_relaxed);
+    BbStats::image_refresh_bytes.fetch_add(image.info.guest_size, std::memory_order_relaxed);
+    u64 queued_mip_bytes = 0;
     boost::container::small_vector<vk::BufferImageCopy, 14> image_copies;
     for (u32 m = 0; m < num_mips; m++) {
         const u32 width = std::max(image.info.size.width >> m, 1u);
@@ -953,15 +950,17 @@ void TextureCache::RefreshImage(Image& image) {
         const auto [mip_size, mip_pitch, mip_height, mip_offset] = image.info.mips_layout[m];
 
         // Protect GPU modified resources from accidental CPU reuploads.
-        if (is_gpu_modified && !is_gpu_dirty) {
-            const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
-            const u64 hash = XXH3_64bits(addr + mip_offset, mip_size);
-            if (image.mip_hashes[m] == hash) {
-                continue;
-            }
-            image.mip_hashes[m] = hash;
+        // Record the guest baseline on every upload, including the initial one.
+        // Otherwise the first unrelated page write can replace later GPU output
+        // (such as the exposure texture) with unchanged stale guest data (PR #6).
+        const auto* mip_addr = std::bit_cast<const u8*>(image.info.guest_address) + mip_offset;
+        const u64 mip_hash = XXH3_64bits(mip_addr, mip_size);
+        if (is_gpu_modified && !is_gpu_dirty && image.mip_hashes[m] == mip_hash) {
+            continue;
         }
+        image.mip_hashes[m] = mip_hash;
 
+        queued_mip_bytes += mip_size;
         const u32 extent_width = mip_pitch ? std::min(mip_pitch, width) : width;
         const u32 extent_height = mip_height ? std::min(mip_height, height) : height;
         image_copies.push_back({
@@ -995,6 +994,9 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     runtime.UploadImage(&image, buffer, image_copies);
+    // Count only the guest mip ranges actually queued for a GPU image copy,
+    // not the full image on every RefreshImage call that may skip all copies.
+    BbStats::image_upload_bytes.fetch_add(queued_mip_bytes, std::memory_order_relaxed);
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
@@ -1023,7 +1025,10 @@ void TextureCache::RegisterImage(ImageId image_id) {
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
     ++registry_generation;
-    total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
+    if (!instance.CanReportMemoryUsage()) {
+        total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
+    }
+    registered_guest_image_bytes += Common::AlignUp(image.info.guest_size, 1024);
     BbStats::live_image_bytes.fetch_add(Common::AlignUp(image.info.guest_size, 1024),
                                         std::memory_order_relaxed);
     BbStats::live_images.fetch_add(1, std::memory_order_relaxed);
@@ -1040,7 +1045,10 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     image.flags &= ~ImageFlagBits::Registered;
     ++registry_generation;
     lru_cache.Free(image.lru_id);
-    total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
+    if (!instance.CanReportMemoryUsage()) {
+        total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
+    }
+    registered_guest_image_bytes -= Common::AlignUp(image.info.guest_size, 1024);
     BbStats::live_image_bytes.fetch_sub(Common::AlignUp(image.info.guest_size, 1024),
                                         std::memory_order_relaxed);
     BbStats::live_images.fetch_sub(1, std::memory_order_relaxed);
@@ -1169,25 +1177,60 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
 }
 
 void TextureCache::GarbageCollectImages() {
+    // bbport: opt-in timings distinguish slow driver budget queries from GC scans.
+    static const bool memory_stats = EmulatorSettingsImpl::Flag("BB_MEMORY_STATS", false);
+    static u64 query_count = 0, query_ns = 0, query_max_ns = 0;
+    static u64 scan_count = 0, scan_ns = 0, scan_max_ns = 0;
     if (instance.CanReportMemoryUsage()) {
-        total_used_memory = instance.GetDeviceMemoryUsage();
-        // bbport: on integrated GPUs (Steam Deck) the usage covers system-memory heaps holding
-        // much more than images (buffers backing guest memory), and the startup budget left
-        // ~1 GB after its 8 GB system reserve: usage stayed above the critical mark, so the
-        // collector evicted images used two or three frames ago on every submission and wrote
-        // GPU-written ones back. Compare with the driver's current budget instead.
-        // BB_GC_BUDGET_MB=N: this rule with a fixed budget on any GPU (tests on a desktop).
+        // Query usage and budget together; do not mix the driver heap usage with
+        // logical guest-image byte increments/decrements in Register/Unregister.
+        const auto query_start = memory_stats ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{};
+        const auto memory = instance.GetMemorySnapshot();
+        if (memory_stats) {
+            const auto elapsed = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - query_start).count());
+            ++query_count;
+            query_ns += elapsed;
+            query_max_ns = std::max(query_max_ns, elapsed);
+        }
+        total_used_memory = memory.usage;
+        bool default_current_budget = instance.IsIntegrated();
+#ifdef _WIN32
+        // WDDM allowances can change after startup on discrete GPUs as well.
+        default_current_budget = true;
+#endif
+        static const bool current_budget =
+            EmulatorSettingsImpl::Flag("BB_GC_CURRENT_BUDGET", default_current_budget);
         static const u64 forced_budget = [] {
             const char* env = std::getenv("BB_GC_BUDGET_MB");
             return env ? std::strtoull(env, nullptr, 10) << 20 : 0;
         }();
-        if (instance.IsIntegrated() || forced_budget) {
-            const u64 budget = forced_budget ? forced_budget : instance.GetDeviceMemoryBudgetNow();
-            if (budget != 0) {
-                trigger_gc_memory = budget / 10 * 7;
-                pressure_gc_memory = budget / 100 * 85;
-                critical_gc_memory = budget / 100 * 95;
+        if (current_budget || forced_budget) {
+            if (const auto limits = CurrentMemoryThresholds(forced_budget ? forced_budget : memory.budget)) {
+                trigger_gc_memory = limits->trigger;
+                pressure_gc_memory = limits->pressure;
+                critical_gc_memory = limits->critical;
             }
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (memory_stats && now - memory_report_time >= std::chrono::seconds{1}) {
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+            std::printf("GPU memory: clock_ns=%lld usage=%llu budget=%llu host_usage=%llu host_budget=%llu "
+                        "guest_images=%llu pressure=%llu critical=%llu evictions=%llu downloads=%llu "
+                        "query_count=%llu query_ns=%llu query_max_ns=%llu "
+                        "scan_count=%llu scan_ns=%llu scan_max_ns=%llu\n",
+                static_cast<long long>(ns),
+                static_cast<unsigned long long>(memory.usage), static_cast<unsigned long long>(memory.budget),
+                static_cast<unsigned long long>(memory.host_usage), static_cast<unsigned long long>(memory.host_budget),
+                static_cast<unsigned long long>(registered_guest_image_bytes.load()),
+                static_cast<unsigned long long>(pressure_gc_memory), static_cast<unsigned long long>(critical_gc_memory),
+                static_cast<unsigned long long>(gc_evictions), static_cast<unsigned long long>(gc_downloads),
+                static_cast<unsigned long long>(query_count), static_cast<unsigned long long>(query_ns),
+                static_cast<unsigned long long>(query_max_ns), static_cast<unsigned long long>(scan_count),
+                static_cast<unsigned long long>(scan_ns), static_cast<unsigned long long>(scan_max_ns));
+            query_max_ns = scan_max_ns = 0; // maxima since the previous one-second report
+            memory_report_time = now;
         }
     }
     BbStats::gc_used_bytes.store(total_used_memory, std::memory_order_relaxed);
@@ -1212,6 +1255,8 @@ void TextureCache::GarbageCollectImages() {
     if (total_used_memory < trigger_gc_memory) {
         return;
     }
+    const auto scan_start = memory_stats ? std::chrono::steady_clock::now()
+                                         : std::chrono::steady_clock::time_point{};
     static const u64 idle_seconds = [] {
         const char* env = std::getenv("BB_GC_IDLE_SECONDS");
         return std::clamp<u64>(env ? std::strtoull(env, nullptr, 10) : 20, 1, 63);
@@ -1321,6 +1366,13 @@ void TextureCache::GarbageCollectImages() {
             gc_report_time = now;
             gc_evictions = gc_downloads = 0;
         }
+    }
+    if (memory_stats) {
+        const auto elapsed = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - scan_start).count());
+        ++scan_count;
+        scan_ns += elapsed;
+        scan_max_ns = std::max(scan_max_ns, elapsed);
     }
 }
 

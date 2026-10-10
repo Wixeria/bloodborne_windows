@@ -19,9 +19,11 @@ from pathlib import Path
 
 SUPPORTED_TITLE = 'CUSA03173'
 SUPPORTED_VERSION = '01.09'
-SUPPORTED_IMAGE = '071df19c8880086d97182dbc057bc8cb37badaca57d9112683836b24a0444c0a'
-# The game loads these first; a broken extraction damages most files, these among them.
 CHECKED_FOLDER = 'dvdroot_ps4/shader'
+SUPPORTED_IMAGE = '071df19c8880086d97182dbc057bc8cb37badaca57d9112683836b24a0444c0a'
+# Exact loaded-image hash of the existing Windows 1.09 dump with Lance's 60 FPS
+# patch. Do not accept arbitrary modified executables: hooks depend on layout.
+WINDOWS_PATCHED_IMAGE = '7e6f9e2b61e4c852780985013531d482d04c31dfcfb3d0e2e6004c6d78deb244'
 
 
 def image_sha256(game):
@@ -51,14 +53,13 @@ def dcx_broken(path):
 def broken_files(game, folder=CHECKED_FOLDER):
     """The .dcx files under the game's folder that do not unpack (paths relative to the game)."""
     root = Path(game)
-    return [str(f.relative_to(root)) for f in sorted((root / folder).rglob('*.dcx')) if dcx_broken(f)]
+    return [f.relative_to(root).as_posix() for f in sorted((root / folder).rglob('*.dcx')) if dcx_broken(f)]
 
 
 def problem(game, image_hash=None):
     """None for the supported game, else (kind, title, version): kind is 'missing_update' (base
-    game or an older update), 'wrong_eboot' (param.sfo says 1.09, eboot.bin is another version),
-    'other_title' (another edition or region), 'unreadable' or 'damaged_files' (the right game,
-    but its shaders do not unpack: a broken extraction)."""
+    game or an older update), 'wrong_eboot' (param.sfo says 1.09, executable is unrecognized),
+    'other_title' (another edition or region) or 'unreadable'."""
     if os.environ.get('BB_SKIP_GAME_CHECK') == '1':
         return None
     from prepare import sfo
@@ -68,7 +69,11 @@ def problem(game, image_hash=None):
         info = {}
     title, version = info.get('TITLE_ID', '?'), info.get('APP_VER', '?')
     try:
-        if (image_hash or image_sha256(game)) == SUPPORTED_IMAGE:
+        digest = image_hash or image_sha256(game)
+        if digest == SUPPORTED_IMAGE:
+            return ('damaged_files', title, version) if broken_files(game) else None
+        if (digest == WINDOWS_PATCHED_IMAGE and title == SUPPORTED_TITLE
+                and version == SUPPORTED_VERSION):
             return ('damaged_files', title, version) if broken_files(game) else None
     except (OSError, ValueError, IndexError, StopIteration, KeyError):
         return 'unreadable', title, version
@@ -86,8 +91,9 @@ def explain(kind, title, version):
         'missing_update': f'{found} bbport needs the 1.09 update merged into the game folder: copy '
                           'everything from the dumped 1.09 update (e.g. CUSA03173-patch) into the '
                           'game folder, replacing files (eboot.bin and sce_sys too).',
-        'wrong_eboot': f'{found} param.sfo is from 1.09 but eboot.bin is not: copy eboot.bin from '
-                       'the dumped 1.09 update into the game folder, replacing the old one.',
+        'wrong_eboot': f'{found} eboot.bin has an unrecognized loaded-image hash. It may be '
+                       'modified or from a different version. Use the supported dumped 1.09 '
+                       'executable; arbitrary pre-patched executables are not supported.',
         'other_title': f'{found} Only Bloodborne {SUPPORTED_TITLE} with update 1.09 is supported '
                        'for now; other editions and regions have a different executable.',
         'unreadable': f'{found} eboot.bin could not be read as a decrypted PS4 executable: dump '

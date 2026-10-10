@@ -10,7 +10,7 @@
 
 namespace Vulkan {
 
-constexpr u64 WAIT_TIMEOUT = std::numeric_limits<u64>::max();
+constexpr u64 VulkanWaitTimeout = std::numeric_limits<u64>::max();
 
 Semaphore::Semaphore(const Instance& instance_) : instance{instance_} {
     const vk::StructureChain semaphore_chain = {
@@ -68,7 +68,7 @@ void Semaphore::Wait(u64 tick) {
 
     // bbport: a lost device ends the wait with a report instead of a silent endless loop.
     while (true) {
-        const vk::Result result = instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT);
+        const vk::Result result = instance.GetDevice().waitSemaphores(&wait_info, VulkanWaitTimeout);
         if (result == vk::Result::eSuccess) {
             break;
         }

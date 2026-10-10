@@ -6,13 +6,23 @@
 #include <initializer_list>
 #include <unistd.h>
 #include "bbport_settings.h"
+#ifdef _WIN32
+#include <windows.h>
+#define setenv(name,value,overwrite) _putenv_s(name,value)
+#define unsetenv(name) _putenv_s(name,"")
+#endif
 
 int main() {
     using namespace BbSettings;
+#ifdef _WIN32
+    char directory[MAX_PATH],path[MAX_PATH];
+    assert(GetTempPathA(MAX_PATH,directory) && GetTempFileNameA(directory,"bbu",0,path));
+#else
     char path[] = "/tmp/bbport-upscaler-test-XXXXXX";
     const int fd = mkstemp(path);
     assert(fd >= 0);
     close(fd);
+#endif
     setenv("BB_CONFIG", path, 1);
     unsetenv("BB_UPSCALER");
     unsetenv("BB_UPSCALE_PRESET");
@@ -40,7 +50,7 @@ int main() {
                 Load();
                 assert(s.upscaler == requested);
                 ConfigureUpscalerSupport(fsr4, fsr411);
-                const bool unsupported = (requested == UpscalerFsr4 && !fsr4) ||
+                const bool unsupported = requested == UpscalerDlss || (requested == UpscalerFsr4 && !fsr4) ||
                     (requested == UpscalerFsr411 && !(fsr4 && fsr411));
                 assert(s.upscaler == (unsupported ? UpscalerFsr3 : requested));
                 assert(s.fsr4_supported == fsr4);

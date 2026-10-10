@@ -36,6 +36,7 @@ EFFECTS={
     'effect_game_aa':('Disable AA',None),
     'effect_dynamic_shadows':('Disable Dynamic Light Shadows (perf increase)',None),
     'effect_ssr':(None,'Enable Screen Space Reflections (READ NOTE)'),
+    'vertex_explosion_fix':(None,'Disable Facegen'),
     'skip_intro':(None,'Skip Intro'),
     'debug_camera':(None,'Restore Debug Camera'),
     'debug_menu':(None,'Restore Debug Menu (READ NOTES)'),
@@ -195,6 +196,28 @@ def scaled_sizes(settings):
     return render,out
 
 
+def launch_plan(settings, render_override='', output_override='', live_override=''):
+    """Resolve the same settings used by the renderer before compiling startup patches."""
+    settings = dict(settings)
+    for env, key in (('BB_UPSCALER', 'upscaler'), ('BB_UPSCALE_PRESET', 'preset')):
+        if env in os.environ:
+            settings[key] = os.environ[env]
+    if output_override:
+        settings['output_res'] = output_override
+    output = output_size(settings)
+    live = live_override or settings.get('live_resolution', '0')
+    # Without a device-capability probe, Auto uses the deterministic startup path.
+    # TAA always needs native guest targets and therefore the live path.
+    sizes = scaled_sizes(settings)
+    render = render_size(settings, render_override) if render_override else None
+    if not render and sizes and live != '1':
+        render = sizes[0]
+    return dict(render=f'{render[0]}x{render[1]}' if render else '',
+                output=f'{output[0]}x{output[1]}',
+                mode='startup' if render else 'live',
+                direct_memory_mb=9152 if render and sizes else None)
+
+
 def resolution_writes(xml,size,app_version,segments,ui=OUTPUT_SIZE):
     writes=compile_patches(xml,[RESOLUTION_TEMPLATE],app_version,segments)
     replacements={SCENE_WIDTH:(0xB8,0x500,size[0]),
@@ -327,7 +350,13 @@ def main():
     p.add_argument('--output-res',default='',help='output resolution WxH (the upscaler\'s; the UI stays 1920x1080)')
     p.add_argument('--print-scaled',action='store_true',
                    help='print "RENDER OUTPUT" (WxH) when bbport.ini selects an output other than 1080p')
+    p.add_argument('--print-launch-plan',action='store_true',
+                   help='print the effective startup/live resolution plan as JSON')
     a=p.parse_args()
+    if a.print_launch_plan:
+        print(json.dumps(launch_plan(read_settings(a.settings), a.render_res, a.output_res,
+                                     os.environ.get('BB_LIVE_RES', ''))))
+        return
     if a.print_scaled:
         sizes=scaled_sizes(read_settings(a.settings))
         if sizes: print(f'{sizes[0][0]}x{sizes[0][1]} {sizes[1][0]}x{sizes[1][1]}')

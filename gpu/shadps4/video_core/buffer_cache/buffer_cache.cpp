@@ -35,11 +35,17 @@
 #include <pthread.h>
 #include <x86intrin.h>
 #include <cstring>
+#ifndef _WIN32
 #include <dlfcn.h>
+#endif
 #include <string>
 #include <fmt/format.h>
+#ifndef _WIN32
 #include <sys/mman.h>
 #include <ucontext.h>
+#else
+#include <windows.h>
+#endif
 #include "common/signal_context.h"
 #include "core/signals.h"
 #include <vk_mem_alloc.h>
@@ -513,7 +519,12 @@ bool ConstantsInPlace() {
 bool Detail::ComputeGuestInPlace() {
     static const bool on = [] {
         const char* env = std::getenv("BB_GUEST_IN_PLACE");
-        const bool enabled = env && env[0] == '1';
+        const char* pc = std::getenv("BB_PC_MODEL");
+#ifdef _WIN32
+        const bool enabled = pc ? pc[0] == '1' : !env || env[0] == '1';
+#else
+        const bool enabled = pc ? pc[0] == '1' : env && env[0] == '1';
+#endif
         if (enabled) {
             std::printf("Guest memory: the GPU uses the game's direct memory in place "
                         "(BB_GUEST_IN_PLACE=1)\n");
@@ -2659,11 +2670,15 @@ bool VramTrapHandler(void* context, void* fault_address) {
             return false;
         }
     }
-    const auto* g = static_cast<const ucontext_t*>(context)->uc_mcontext.gregs;
-    const u64 rip = u64(g[REG_RIP]);
+    const u64 rip = reinterpret_cast<u64>(Common::GetRip(context));
+#ifdef _WIN32
+    const u64 rsp = static_cast<EXCEPTION_POINTERS*>(context)->ContextRecord->Rsp;
+#else
+    const u64 rsp = static_cast<const ucontext_t*>(context)->uc_mcontext.gregs[REG_RSP];
+#endif
     constexpr u64 Image = 0x800000000ull, ImageEnd = 0x810000000ull;
     u64 caller = 0;
-    const auto* stack = reinterpret_cast<const u64*>(g[REG_RSP]);
+    const auto* stack = reinterpret_cast<const u64*>(rsp);
     for (u32 i = 0; i < 48; ++i) {
         if (stack[i] >= Image && stack[i] < ImageEnd) {
             caller = stack[i] - Image;
@@ -2697,7 +2712,7 @@ bool VramTrapHandler(void* context, void* fault_address) {
             trap.address = address;
         }
     }
-    mprotect(reinterpret_cast<void*>(block), vram_trap_block_size, PROT_READ | PROT_WRITE);
+    runtime_memory_trap(block, vram_trap_block_size, 64, 0);
     return true;
 }
 
@@ -2705,12 +2720,16 @@ std::string VramTrapSiteName(u64 rip) {
     if (!(rip >> 63)) {
         return fmt::format("+{:#x}", rip);
     }
+#ifdef _WIN32
+    return fmt::format("host {:#x}", rip & ~(1ull << 63));
+#else
     Dl_info info{};
     const u64 address = rip & ~(1ull << 63);
     dladdr(reinterpret_cast<void*>(address), &info);
     const char* name = info.dli_fname ? std::strrchr(info.dli_fname, '/') : nullptr;
     return fmt::format("host {}+{:#x}", name ? name + 1 : "?",
                        address - reinterpret_cast<u64>(info.dli_fbase));
+#endif
 }
 
 void ReportVramTraps() {
@@ -2725,7 +2744,7 @@ void ReportVramTraps() {
             }
         }
         for (const u64 block : blocks) {
-            mprotect(reinterpret_cast<void*>(block), vram_trap_block_size, PROT_NONE);
+            runtime_memory_trap(block, vram_trap_block_size, 64, 1);
         }
         static auto last = std::chrono::steady_clock::now();
         if (std::chrono::steady_clock::now() - last < std::chrono::seconds(3)) {
@@ -2897,7 +2916,7 @@ void BufferCache::QueuePromotions(u64 submitted) {
             vram_trap_block_size = block_size;
             std::scoped_lock lk{vram_trapped_mutex};
             vram_trapped[address] = block_size;
-            mprotect(reinterpret_cast<void*>(address), block_size, PROT_NONE);
+            runtime_memory_trap(address, block_size, 64, 1);
         }
     }
     if (moved == 0) {

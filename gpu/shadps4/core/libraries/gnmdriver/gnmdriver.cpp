@@ -3,6 +3,8 @@
 
 #include "gnm_error.h"
 #include "gnmdriver.h"
+#include "bbport_reflex_trace.h"
+#include "video_core/renderer_vulkan/vk_dlssg.h"
 
 #include "common/assert.h"
 #include "common/debug.h"
@@ -2328,6 +2330,8 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
 
 static inline s32 PerformSubmit(u32 count, const u32* dcb_gpu_addrs[], u32* dcb_sizes_in_bytes,
                                 const u32* ccb_gpu_addrs[], u32* ccb_sizes_in_bytes) {
+    BbReflexTrace::Event("submit");
+    Vulkan::Dlssg::GuestSubmit();
     if (DebugState.ShouldPauseInSubmit()) {
         DebugState.PauseGuestThreads();
     }
@@ -2522,6 +2526,8 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_gpu_addrs[
 }
 
 s32 PS4_SYSV_ABI sceGnmSubmitDone() {
+    BbReflexTrace::End();
+    Vulkan::Dlssg::GuestDone();
     HLE_TRACE;
     BbStats::submit_done_calls.fetch_add(1, std::memory_order_relaxed);
     BbTimeline::Note(BbTimeline::GuestSubmitDone, u64(frames_submitted) + 1);

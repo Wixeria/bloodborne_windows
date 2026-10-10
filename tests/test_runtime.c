@@ -208,6 +208,29 @@ static void direct_memory(void) {
  * own mprotect keeps them, and a new mapping starts without them. */
 void runtime_memory_trap(uintptr_t address, uint64_t size, unsigned reason, int on);
 unsigned runtime_memory_trap_reasons(uintptr_t address);
+#ifdef _WIN32
+#include <windows.h>
+static jmp_buf trap_jump;
+static volatile unsigned char *trap_address;
+static LONG CALLBACK trap_fault(EXCEPTION_POINTERS *exception) {
+    if (exception->ExceptionRecord->ExceptionCode!=EXCEPTION_ACCESS_VIOLATION ||
+        exception->ExceptionRecord->ExceptionInformation[1]!=(uintptr_t)trap_address)
+        return EXCEPTION_CONTINUE_SEARCH;
+    longjmp(trap_jump,1);
+}
+static int access_faults(volatile unsigned char *p,int write) {
+    trap_address=p;
+    void *handler=AddVectoredExceptionHandler(1,trap_fault); assert(handler);
+    int faulted=0;
+    if (setjmp(trap_jump)) faulted=1;
+    else if (write) *p=0x5a;
+    else (void)*p;
+    assert(RemoveVectoredExceptionHandler(handler)); trap_address=NULL;
+    return faulted;
+}
+static int write_faults(volatile unsigned char *p) { return access_faults(p,1); }
+static int read_faults(volatile unsigned char *p) { return access_faults(p,0); }
+#else
 static sigjmp_buf trap_jump;
 static void trap_fault(int sig) { (void)sig; siglongjmp(trap_jump,1); }
 static int write_faults(volatile unsigned char *p) {
@@ -232,6 +255,7 @@ static int read_faults(volatile unsigned char *p) {
     sigaction(SIGSEGV,&old,NULL);
     return faulted;
 }
+#endif
 typedef int32_t (ABI *Protect)(const void *, uint64_t, int);
 static void write_traps(void) {
     Allocate alloc=GET(Allocate,"rTXw65xmLIA#p#J");

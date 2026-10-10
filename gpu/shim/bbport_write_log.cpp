@@ -7,8 +7,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <ucontext.h>
 #include <unistd.h>
+#endif
 #include <x86intrin.h>
 
 namespace BbWriteLog {
@@ -57,7 +61,11 @@ void Note(std::uint64_t address, const void* data, std::uint64_t size, Source so
 }
 
 void Record(std::uint64_t address, const void* data, std::uint64_t size, Source source) {
+    #ifdef _WIN32
+    static thread_local const std::uint32_t tid=GetCurrentThreadId();
+#else
     static thread_local const std::uint32_t tid = static_cast<std::uint32_t>(gettid());
+#endif
     Entry e{address, size, 0, __rdtsc(), source, tid};
     std::memcpy(&e.first, data, size < 8 ? size : 8);
     Push(ring, head, e);
@@ -105,16 +113,24 @@ void DumpRange(std::uint64_t address, std::uint64_t size) {
 
 extern "C" void bbgpu_dump_guest_writes(void* ucontext) {
     using namespace BbWriteLog;
-    const auto* uc = static_cast<const ucontext_t*>(ucontext);
-    const auto* g = uc->uc_mcontext.gregs;
-    BbFreeCheck::DumpAtFault(std::uint64_t(g[REG_RAX]), std::uint64_t(g[REG_R14]));
+#ifndef _WIN32
+    const auto* fault_context = static_cast<const ucontext_t*>(ucontext);
+    BbFreeCheck::DumpAtFault(fault_context->uc_mcontext.gregs[REG_RAX], fault_context->uc_mcontext.gregs[REG_R14]);
+#endif
     if (Mode() == 0) {
         return;
     }
+#ifdef _WIN32
+    const auto* context=static_cast<const CONTEXT*>(ucontext);
+    const std::uint64_t regs[]={context->Rax,context->Rbx,context->Rcx,context->Rdx,context->Rsi,context->Rdi,context->R14,context->R15};
+#else
+    const auto* uc = static_cast<const ucontext_t*>(ucontext);
+    const auto* g = uc->uc_mcontext.gregs;
     const std::uint64_t regs[] = {std::uint64_t(g[REG_RAX]), std::uint64_t(g[REG_RBX]),
                                   std::uint64_t(g[REG_RCX]), std::uint64_t(g[REG_RDX]),
                                   std::uint64_t(g[REG_RSI]), std::uint64_t(g[REG_RDI]),
                                   std::uint64_t(g[REG_R14]), std::uint64_t(g[REG_R15])};
+#endif
     const char* names[] = {"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "r14", "r15"};
     for (int i = 0; i < 8; ++i) {
         std::fprintf(stderr, "Write log: %s=%#llx\n", names[i], (unsigned long long)regs[i]);
@@ -137,7 +153,15 @@ extern "C" void bbgpu_dump_guest_writes(void* ucontext) {
     const std::uint64_t block = regs[0];
     for (std::uint64_t at = block - 0x30; at < block + 0x60; at += 8) {
         std::uint64_t value = 0;
+#ifdef _WIN32
+        SIZE_T copied=0;
+        if (!ReadProcessMemory(GetCurrentProcess(),reinterpret_cast<const void*>(at),&value,8,&copied) || copied!=8) {
+            std::fprintf(stderr,"Write log: [%#llx] unreadable\n",static_cast<unsigned long long>(at));
+            continue;
+        }
+#else
         std::memcpy(&value, reinterpret_cast<const void*>(at), 8);
+#endif
         std::fprintf(stderr, "Write log: [%#llx] = %#llx\n", (unsigned long long)at,
                      (unsigned long long)value);
     }
@@ -165,11 +189,11 @@ extern "C" void bbgpu_dump_guest_writes(void* ucontext) {
     int shown = 0;
     for (std::uint64_t i = n; i-- > (n > Size ? n - Size : 0) && shown < 64;) {
         const Entry& e = ring[i % Size];
-        bool near = false;
+        bool is_near = false;
         for (const auto r : regs) {
-            near |= r + 0x1000 > e.address && r < e.address + e.size + 0x1000;
+            is_near |= r + 0x1000 > e.address && r < e.address + e.size + 0x1000;
         }
-        if (near) {
+        if (is_near) {
             print(e, "near");
             ++shown;
         }

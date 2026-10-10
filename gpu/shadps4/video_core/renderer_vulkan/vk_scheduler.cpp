@@ -9,9 +9,13 @@
 #include <unordered_map>
 #include <cstring>
 #include <string>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <unistd.h>
+#endif
 #include <functional>
 
 #include "bbport_copy.h"
@@ -35,8 +39,18 @@ namespace {
 thread_local const char* producer_scope_where = nullptr;
 std::atomic<u32> producer_reports{0};
 
+u32 HostThreadId() {
+#ifdef _WIN32
+    return GetCurrentThreadId();
+#else
+    return u32(gettid());
+#endif
+}
 /// Names a thread of this process (its comm).
 std::string ThreadName(u32 tid) {
+#ifdef _WIN32
+    return "tid " + std::to_string(tid);
+#else
     char path[64];
     std::snprintf(path, sizeof(path), "/proc/self/task/%u/comm", tid);
     std::string name = "?";
@@ -51,26 +65,32 @@ std::string ThreadName(u32 tid) {
         std::fclose(file);
     }
     return name;
+#endif
 }
 
 void ReportProducer(const char* what, u32 other, const char* other_where, const char* where) {
     if (producer_reports.fetch_add(1, std::memory_order_relaxed) >= 8) {
         return;
     }
-    const u32 self = u32(gettid());
+    const u32 self = HostThreadId();
     std::fprintf(stderr,
                  "Scheduler: %s: thread %u (%s) entering %s while thread %u (%s) is in %s\n",
                  what, self, ThreadName(self).c_str(), where, other, ThreadName(other).c_str(),
                  other_where ? other_where : "?");
     void* frames[24];
+#ifdef _WIN32
+    const USHORT depth = CaptureStackBackTrace(0, 24, frames, nullptr);
+    for (USHORT i=0; i<depth; ++i) std::fprintf(stderr, "  %p\n", frames[i]);
+#else
     const int depth = backtrace(frames, 24);
     backtrace_symbols_fd(frames, depth, 2);
+#endif
 }
 } // namespace
 
 void Scheduler::ProducerScope::Enter(const char* where) noexcept {
     previous_where = producer_scope_where;
-    static thread_local const u32 tid = u32(gettid());
+    static thread_local const u32 tid = HostThreadId();
     producer_scope_where = where;
     u32 expected = 0;
     if (scheduler.producer_tid.compare_exchange_strong(expected, tid,
@@ -297,6 +317,10 @@ void Scheduler::TracePassBreak(void* caller) {
                 static_cast<unsigned long long>(breaks),
                 std::chrono::duration<double>(now - last).count());
     for (size_t i = 0; i < std::min<size_t>(top.size(), 10); ++i) {
+#ifdef _WIN32
+        std::printf("Render pass break caller: %llu x %p\n",
+                    static_cast<unsigned long long>(top[i].first), top[i].second);
+#else
         Dl_info info{};
         dladdr(top[i].second, &info);
         std::printf("Render pass break caller: %llu x %s+0x%lx\n",
@@ -304,6 +328,7 @@ void Scheduler::TracePassBreak(void* caller) {
                     info.dli_fname ? info.dli_fname : "?",
                     static_cast<unsigned long>(reinterpret_cast<uintptr_t>(top[i].second) -
                                                reinterpret_cast<uintptr_t>(info.dli_fbase)));
+#endif
     }
     callers.clear();
     breaks = 0;
@@ -332,13 +357,26 @@ void Scheduler::TraceDirectRecording(void* caller) {
     }
     std::ranges::sort(top, std::greater{});
     for (size_t i = 0; i < std::min<size_t>(top.size(), 8); ++i) {
+#ifdef _WIN32
+        HMODULE module=nullptr;
+        char path[MAX_PATH]="?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<const char*>(top[i].second),&module)) {
+            GetModuleFileNameA(module,path,sizeof(path));
+            path[sizeof(path)-1]=0;
+        }
+        std::printf("Recorder sync caller: %llu x %s+0x%llx\n",
+            static_cast<unsigned long long>(top[i].first),path,
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(top[i].second)-reinterpret_cast<uintptr_t>(module)));
+#else
         Dl_info info{};
         dladdr(top[i].second, &info);
         std::printf("Recorder sync caller: %llu x %s+0x%lx\n",
                     static_cast<unsigned long long>(top[i].first),
                     info.dli_fname ? info.dli_fname : "?",
                     static_cast<unsigned long>(reinterpret_cast<uintptr_t>(top[i].second) -
-                                               reinterpret_cast<uintptr_t>(info.dli_fbase)));
+                                                 reinterpret_cast<uintptr_t>(info.dli_fbase)));
+#endif
     }
     callers.clear();
 }
@@ -526,7 +564,7 @@ void Scheduler::HandOver() {
         inside && (std::strcmp(inside, "Record") == 0 || std::strcmp(inside, "RecordData") == 0 ||
                    std::strcmp(inside, "RecordOrdered") == 0 ||
                    std::strcmp(inside, "RetireChunk") == 0)) {
-        ReportProducer("REENTERED recording", u32(gettid()), inside, "HandOver");
+        ReportProducer("REENTERED recording", HostThreadId(), inside, "HandOver");
     }
     ProducerScope producer{*this, "HandOver"};
     if (!record_chunk || !ordered_chunk) {

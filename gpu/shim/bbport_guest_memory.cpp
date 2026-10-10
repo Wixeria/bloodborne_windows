@@ -1,3 +1,6 @@
+#ifdef _WIN32
+#include "bbport_guest_memory_windows.h"
+#else
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_guest_memory.h"
 
@@ -736,3 +739,5 @@ const Chunk* Find(std::uint64_t phys) {
     return phys < c->phys + c->size ? c : nullptr;
 }
 } // namespace BbGuestMemory
+
+#endif

@@ -1,0 +1,13 @@
+[
+  {"seconds": 5, "pad": ""},
+  {"seconds": 4, "pad": "rx=255"},
+  {"seconds": 4, "pad": ""},
+  {"seconds": 0.25, "pad": "r1"},
+  {"seconds": 0.75, "pad": ""},
+  {"seconds": 0.25, "pad": "r1"},
+  {"seconds": 0.75, "pad": ""},
+  {"seconds": 0.25, "pad": "r1"},
+  {"seconds": 2.75, "pad": ""},
+  {"seconds": 4, "pad": "rx=0"},
+  {"seconds": 8, "pad": ""}
+]

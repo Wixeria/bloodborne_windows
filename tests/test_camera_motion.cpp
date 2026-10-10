@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Execute production camera motion SPIR-V: distant geometry, sky and stale object vectors.
+#include "gpu_release_headers.h"
 #include <array>
 #include <cassert>
 #include <cmath>

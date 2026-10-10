@@ -5,6 +5,7 @@
 #define _GNU_SOURCE
 #endif
 #include "runtime.h"
+#include "runtime_host_fs.h"
 #include <dirent.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -94,28 +95,27 @@ static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint
     uint32_t count=0;
     char root[4096];
     snprintf(root,sizeof(root),"%s/addcont",runtime_file_user_dir());
-    DIR *titles=opendir(root);
-    for (struct dirent *t; titles && (t=readdir(titles));) {
-        if (t->d_name[0]=='.') continue;
-        int title=openat(dirfd(titles),t->d_name,O_RDONLY|O_DIRECTORY);
-        DIR *labels=title>=0 ? fdopendir(title) : NULL;
-        if (!labels && title>=0) close(title);
-        for (struct dirent *l; labels && (l=readdir(labels));) {
-            struct stat entry;
-            size_t n=strlen(l->d_name);
-            if (l->d_name[0]=='.' || n>=LABEL_SIZE || fstatat(dirfd(labels),l->d_name,&entry,0) ||
-                !S_ISDIR(entry.st_mode) || (fill && count>=capacity)) continue;
+    RuntimeHostDirectory *titles=runtime_host_opendir(root);
+    for (const RuntimeHostEntry *t; titles && (t=runtime_host_readdir(titles));) {
+        if (t->name[0]=='.' || !t->directory) continue;
+        char title[5200];
+        int length=snprintf(title,sizeof(title),"%s/%s",root,t->name);
+        if (length<0 || (size_t)length>=sizeof(title)) continue;
+        RuntimeHostDirectory *labels=runtime_host_opendir(title);
+        for (const RuntimeHostEntry *l; labels && (l=runtime_host_readdir(labels));) {
+            size_t n=strlen(l->name);
+            if (l->name[0]=='.' || n>=LABEL_SIZE || !l->directory || (fill && count>=capacity)) continue;
             if (fill) {
                 AddonInfo info;
-                memset(&info,'\0',sizeof(info)); memcpy(info.label,l->d_name,n);
+                memset(&info,'\0',sizeof(info)); memcpy(info.label,l->name,n);
                 info.status=ADDON_INSTALLED;
                 memcpy((unsigned char *)list+(size_t)count*sizeof(info),&info,sizeof(info));
             }
             ++count;
         }
-        if (labels) closedir(labels);
+        if (labels) runtime_host_closedir(labels);
     }
-    if (titles) closedir(titles);
+    if (titles) runtime_host_closedir(titles);
     if (hits) *hits=count;
     if (count) printf("Runtime: AppContent add-ons reported installed (%s): %u\n",root,(unsigned)count);
     ++lists; return 0;

@@ -3,13 +3,9 @@
 #include <time.h>
 #include <stdint.h>
 #include <stddef.h>
-#ifndef _WIN32
-#include <setjmp.h>
-/* Recovery point for speculative guest memory reads on this thread (probe.c fault handler). */
-extern __thread sigjmp_buf *runtime_fault_recover;
+#include "runtime_fault.h"
 /* Restarts the game (in-game settings menu, render resolution change). */
 void runtime_restart(void);
-#endif
 #define ABI __attribute__((sysv_abi))
 typedef void (ABI *GuestCallback)(void);
 void runtime_start(uint64_t capabilities);
@@ -31,7 +27,7 @@ void runtime_wait_report(double frames);
 void runtime_guest_call_sites(uint64_t out[3]);
 /* bbport: times the game's heap asked for more memory (posix_mmap): a sign it leaks. */
 uint64_t runtime_heap_growths(void);
-static inline uint64_t runtime_wait_clock(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000+(uint64_t)t.tv_nsec; }
+uint64_t runtime_wait_clock(void);
 const char *runtime_import_name(const char *name);
 uintptr_t runtime_rwlock_resolve(const char *name);
 void runtime_rwlock_report(void);
@@ -61,6 +57,7 @@ uintptr_t runtime_services_resolve(const char *name);
 void runtime_file_report(void);
 void runtime_file_configure(const char *app0, const char *user);
 int runtime_file_mount(const char *guest, const char *host);
+int runtime_file_mount_mode(const char *guest,const char *host,int readonly);
 void runtime_file_unmount(const char *guest);
 int runtime_file_translate(const char *guest, char *out, size_t size);
 int64_t runtime_file_open(const char *path, int flags, int mode);
@@ -76,6 +73,10 @@ void runtime_thread_keys_cleanup(void);
 /* Guest-visible errno values are FreeBSD's. */
 int32_t runtime_guest_errno(int host_errno);
 void *runtime_low_map(size_t size, int prot);
+int runtime_low_unmap(void *address, size_t size);
+uintptr_t runtime_tls_resolve(const char *name);
+void runtime_tls_cleanup(void);
+uintptr_t runtime_thread_keys_resolve(const char *name);
 uintptr_t runtime_ajm_resolve(const char *name);
 void runtime_ajm_report(void);
 uintptr_t runtime_audio_resolve(const char *name);

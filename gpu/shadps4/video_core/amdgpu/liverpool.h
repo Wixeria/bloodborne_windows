@@ -27,6 +27,7 @@
 
 namespace Vulkan {
 class Rasterizer;
+struct DlssgFrame;
 }
 
 namespace Libraries::VideoOut {
@@ -260,7 +261,8 @@ private:
         std::chrono::steady_clock::time_point submitted;
     };
     Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, u64 seq = NoSeq,
-                         std::shared_ptr<SubmittedCopy> copy = {});
+                         std::shared_ptr<SubmittedCopy> copy = {},
+                         std::shared_ptr<Vulkan::DlssgFrame> timing = {});
     /// After a copied submission is decoded: whether the guest changed its command buffers since.
     static void CheckSubmittedCopy(const SubmittedCopy& copy, u64 seq);
     Task ProcessCeUpdate(std::span<const u32> ccb);

@@ -57,6 +57,7 @@ template <class T>
 class AvPlayerQueue {
 public:
     size_t Size() {
+        std::lock_guard guard(m_mutex);
         return m_queue.size();
     }
 
@@ -65,15 +66,18 @@ public:
         m_queue.emplace(std::forward<T>(value));
     }
 
-    T& Front() {
-        return m_queue.front();
+    std::optional<T> Pop() {
+        return PopIf([](const T&) { return true; });
     }
 
-    std::optional<T> Pop() {
-        if (Size() == 0) {
+    /// Check readiness and remove under the same lock. Stop/Reset may clear the
+    /// queue concurrently; never expose a reference that survives unlocking.
+    template <class Predicate>
+    std::optional<T> PopIf(Predicate ready) {
+        std::lock_guard guard(m_mutex);
+        if (m_queue.empty() || !ready(m_queue.front())) {
             return std::nullopt;
         }
-        std::lock_guard guard(m_mutex);
         auto result = std::move(m_queue.front());
         m_queue.pop();
         return result;

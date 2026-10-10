@@ -4,9 +4,13 @@
 #include <chrono>
 #include <thread>
 #include <pthread.h>
+#ifndef _WIN32
 #include <sys/resource.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#else
+#include <windows.h>
+#endif
 #include <array>
 #include <optional>
 #include <utility>
@@ -123,9 +127,11 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+    #ifndef _WIN32
     if (clockid_t clock; pthread_getcpuclockid(pthread_self(), &clock) == 0) {
         BbStats::gpu_thread_clock.store(static_cast<int>(clock));
     }
+    #endif
     gpu_id = std::this_thread::get_id();
 #ifdef __linux__
     gpu_tid = gettid();
@@ -1370,8 +1376,10 @@ bool Liverpool::PredicationSkips(const PM4Header* header) {
 }
 
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
-                                           u64 seq, std::shared_ptr<SubmittedCopy> copy) {
+                                           u64 seq, std::shared_ptr<SubmittedCopy> copy,
+                                           std::shared_ptr<Vulkan::DlssgFrame> timing) {
     FIBER_ENTER(dcb_task_name);
+    if (timing && rasterizer) rasterizer->SetReflexFrame(timing);
     // Top-level buffers enqueued for the draw preparation workers (nested IBs are not).
     Vulkan::DrawPreparation* draw_prep =
         seq != NoSeq && rasterizer ? &rasterizer->GetDrawPreparation() : nullptr;
@@ -2295,6 +2303,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
     if (seq != NoSeq && BbStats::enabled) {
         BbStats::submissions.fetch_add(1, std::memory_order_relaxed);
+#ifdef _WIN32
+        FILETIME creation, exit_time, kernel, user;
+        if (GetThreadTimes(GetCurrentThread(), &creation, &exit_time, &kernel, &user)) {
+            const auto micros = [](FILETIME t) { return ((u64(t.dwHighDateTime) << 32) | t.dwLowDateTime) / 10; };
+            BbStats::gpu_user_us.store(micros(user), std::memory_order_relaxed);
+            BbStats::gpu_sys_us.store(micros(kernel), std::memory_order_relaxed);
+        }
+#else
         if (rusage usage{}; getrusage(RUSAGE_THREAD, &usage) == 0) {
             BbStats::gpu_user_us.store(u64(usage.ru_utime.tv_sec) * 1000000 + usage.ru_utime.tv_usec,
                                        std::memory_order_relaxed);
@@ -2304,6 +2320,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             BbStats::gpu_vol_switches.store(usage.ru_nvcsw, std::memory_order_relaxed);
             BbStats::gpu_minor_faults.store(usage.ru_minflt, std::memory_order_relaxed);
         }
+#endif
     }
 
     if (copy && BbFreeCheck::Enabled()) {
@@ -2729,7 +2746,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
             draw_prep->Enqueue(seq, std::move(prep_submission));
         }
         BbFreeCheck::NoteSubmit(seq, copy ? copy->guest_dcb : dcb.data(), dcb.size_bytes());
-        auto task = ProcessGraphics(dcb, ccb, seq, std::move(copy));
+        auto task = ProcessGraphics(dcb, ccb, seq, std::move(copy), Vulkan::Dlssg::GuestFrame());
         queue.submits.emplace(task.handle);
     }
 
@@ -2819,8 +2836,14 @@ void Liverpool::CheckSubmittedCopy(const SubmittedCopy& copy, u64 seq) {
         std::array<u32, 1024> buf;
         for (std::size_t at = 0; at < dwords; at += buf.size()) {
             const std::size_t n = std::min(buf.size(), dwords - at);
+#ifdef _WIN32
+            SIZE_T bytes = 0;
+            const bool read = ReadProcessMemory(GetCurrentProcess(), guest+at, buf.data(), n*4, &bytes) && bytes == n*4;
+#else
             iovec local{buf.data(), n * 4}, remote{const_cast<u32*>(guest + at), n * 4};
-            if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != ssize_t(n * 4)) {
+            const bool read = process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == ssize_t(n*4);
+#endif
+            if (!read) {
                 // bbport BB_GUEST_IN_PLACE: dma-buf guest memory is not readable that way; still
                 // mapped, it is read directly.
                 int prot = 0, type = -1;
@@ -2872,8 +2895,13 @@ void Liverpool::CheckSubmittedCopy(const SubmittedCopy& copy, u64 seq) {
     const std::size_t dwords = dcb_change != -1 ? copy.dcb_dwords : copy.ccb_dwords;
     const std::size_t from = at >= 8 ? at - 8 : 0, to = std::min<std::size_t>(dwords, at + 8);
     std::array<u32, 16> now{};
+#ifdef _WIN32
+    SIZE_T bytes = 0;
+    const bool readable = ReadProcessMemory(GetCurrentProcess(), guest+from, now.data(), (to-from)*4, &bytes) && bytes == (to-from)*4;
+#else
     iovec local{now.data(), (to - from) * 4}, remote{const_cast<u32*>(guest + from), (to - from) * 4};
     const bool readable = process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == ssize_t((to - from) * 4);
+#endif
     std::printf("  submitted:");
     for (std::size_t i = from; i < to; ++i) {
         std::printf(i == std::size_t(at) ? " [%08x]" : " %08x", kept[i]);

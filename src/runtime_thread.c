@@ -1,21 +1,32 @@
 /* Guest threads on host pthreads. Each guest thread owns a FreeBSD-style TCB
  * (variant II: static TLS below the TCB). The loader rewrites the eboot's
- * `mov rax, fs:[0]` into `mov rax, gs:[0]`, so GS base = guest TCB while glibc
- * keeps FS. Priorities/affinity are recorded, not enforced by a PS4 scheduler. */
+ * `mov rax, fs:[0]` into `mov rax, gs:[0]`. Linux uses a guest GS base; Windows
+ * patches that load to an allocated native TLS slot while retaining its TEB.
+ * Priorities/affinity are recorded, not enforced by a PS4 scheduler. */
 #define _GNU_SOURCE
-#include "runtime.h"
+#ifdef _WIN32
+/* Guest frames have no Windows unwind metadata. Exit must restore registers
+   directly, without walking guest frames through RtlUnwindEx. */
+#define __USE_MINGW_SETJMP_NON_SEH
+#endif
+#include "runtime_thread.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifndef _WIN32
 #include <pthread.h>
 #include <sched.h>
 #include <setjmp.h>
 #include <errno.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <winternl.h>
+#else
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <sys/mman.h>
 #include <asm/prctl.h>
+#endif
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
 #define ATTR_MAGIC UINT32_C(0x41545452)
 #define STACK_MARGIN (256*1024)
@@ -34,6 +45,8 @@ typedef struct GuestThread {
     /* Guest-visible TCB is allocated separately; this is the ScePthread handle. */
     uint64_t *tcb;
     unsigned char *tls_block;
+    size_t tls_bytes;
+    uint64_t dtv[3];
     pthread_t host;
     GuestEntry entry;
     void *argument, *result;
@@ -48,37 +61,141 @@ static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
 static ThreadAttr *attributes;
 static GuestThread *threads;
 static _Thread_local GuestThread *current;
-static _Thread_local int32_t guest_errno;
 static const unsigned char *tls_template;
 static uint64_t tls_filesz, tls_memsz, tls_align=16;
+static int tls_started;
 static size_t created, joined_count, exited;
+static pthread_once_t cleanup_once=PTHREAD_ONCE_INIT;
+static pthread_key_t cleanup_key;
+static void cleanup_thread(void *value);
+static void initialize_cleanup(void) {
+    if (pthread_key_create(&cleanup_key,cleanup_thread)) { fputs("STOP: cannot allocate guest cleanup key\n",stderr); exit(21); }
+}
 
 void runtime_set_main_tls(const void *data,uint64_t filesz,uint64_t memsz,uint64_t align) {
+    if (filesz>memsz || memsz>1024*1024 || (filesz && !data) || (align && ((align & (align-1)) || align>4096))) {
+        fputs("STOP: unsupported main TLS layout\n",stderr); exit(21);
+    }
+    pthread_mutex_lock(&lock);
+    if (tls_started) { pthread_mutex_unlock(&lock); fputs("STOP: main TLS reconfigured after thread attach\n",stderr); exit(21); }
     tls_template=data; tls_filesz=filesz; tls_memsz=memsz; tls_align=align ? align : 16;
+    pthread_mutex_unlock(&lock);
 }
 static uint64_t tls_offset(void) { return (tls_memsz+tls_align-1)&~(tls_align-1); }
+#ifdef _WIN32
+static pthread_once_t slot_once=PTHREAD_ONCE_INIT;
+static DWORD guest_slot=TLS_OUT_OF_INDEXES;
+static uint32_t guest_displacement;
+_Static_assert(offsetof(TEB,TlsSlots)==0x1480,"Windows x64 direct TLS slot layout");
+static void *read_guest_slot(void) {
+    void *value;
+    __asm__ volatile("movq %%gs:(%1),%0" : "=r"(value) : "r"((uintptr_t)guest_displacement) : "memory");
+    return value;
+}
+static void initialize_slot(void) {
+    guest_slot=TlsAlloc();
+    if (guest_slot==TLS_OUT_OF_INDEXES || guest_slot>=64) {
+        if (guest_slot!=TLS_OUT_OF_INDEXES) TlsFree(guest_slot);
+        fputs("STOP: no direct Windows TLS slot for guest thread pointer\n",stderr); exit(21);
+    }
+    guest_displacement=(uint32_t)(offsetof(TEB,TlsSlots)+guest_slot*sizeof(void *));
+    int marker;
+    if (!TlsSetValue(guest_slot,&marker) || read_guest_slot()!=&marker || !TlsSetValue(guest_slot,NULL)) {
+        fputs("STOP: incompatible Windows guest TLS slot layout\n",stderr); exit(21);
+    }
+}
+static void set_gs(void *base) {
+    pthread_once(&slot_once,initialize_slot);
+    if (!TlsSetValue(guest_slot,base) || read_guest_slot()!=base) {
+        fputs("STOP: cannot install Windows guest TLS\n",stderr); exit(21);
+    }
+}
+#else
 static void set_gs(void *base) {
     if (syscall(SYS_arch_prctl,ARCH_SET_GS,(unsigned long)base)) { perror("STOP: arch_prctl(ARCH_SET_GS)"); exit(21); }
 }
-/* Build TCB/static TLS for the calling host thread and point GS at it. */
+#endif
+void runtime_thread_prepare_host(void) {
+#ifdef _WIN32
+    pthread_once(&slot_once,initialize_slot);
+#endif
+}
+size_t runtime_thread_patch_tls_loads(void *code,size_t size) {
+#ifdef _WIN32
+    static const unsigned char prepared[]={0x65,0x48,0x8b,0x04,0x25,0,0,0,0};
+    if (!code || size<sizeof(prepared)) return 0;
+    pthread_once(&slot_once,initialize_slot);
+    unsigned char *bytes=code;
+    size_t patched=0;
+    for (size_t i=0;i<=size-sizeof(prepared);++i) if (!memcmp(bytes+i,prepared,sizeof(prepared))) {
+        memcpy(bytes+i+5,&guest_displacement,sizeof(guest_displacement));
+        ++patched; i+=sizeof(prepared)-1;
+    }
+    if (patched && !FlushInstructionCache(GetCurrentProcess(),code,size)) {
+        fputs("STOP: cannot flush patched guest TLS code\n",stderr); exit(21);
+    }
+    return patched;
+#else
+    (void)code; (void)size; return 0;
+#endif
+}
+/* Build TCB/static TLS and install the calling thread's guest pointer. */
 static void attach(GuestThread *t) {
+#ifdef _WIN32
+    /* Native stacks preserve TEB/SEH bounds. Reject a stack whose pointers
+       would be truncated by the guest's 40-bit address representation. */
+    NT_TIB *tib=(NT_TIB *)(void *)NtCurrentTeb();
+    if ((uintptr_t)tib->StackBase>UINT64_C(0x10000000000)) {
+        fprintf(stderr,"STOP: native Windows stack 0x%llx exceeds the guest 40-bit range\n",
+                (unsigned long long)(uintptr_t)tib->StackBase);
+        /* Do not run process-wide C++/GPU destructors while other guest threads
+           are still running after this fatal compatibility failure. */
+        _exit(21);
+    }
+#endif
+    pthread_mutex_lock(&lock); tls_started=1;
     uint64_t offset=tls_offset();
+    pthread_mutex_unlock(&lock);
     size_t total=offset+256;
+#ifdef _WIN32
+    unsigned char *block=runtime_low_map(total,3);
+#else
     unsigned char *block=aligned_alloc(64,(total+63)&~(size_t)63);
+#endif
     if (!block) { fputs("Cannot allocate guest TLS\n",stderr); exit(1); }
     memset(block,0,total);
     if (tls_filesz) memcpy(block,tls_template,tls_filesz);
     uint64_t *tcb=(uint64_t *)(block+offset);
-    static uint64_t dtv[3];
     tcb[0]=(uint64_t)(uintptr_t)tcb;         /* tcb_self */
-    tcb[1]=(uint64_t)(uintptr_t)dtv;         /* tcb_dtv (static module only) */
+    tcb[1]=(uint64_t)(uintptr_t)t->dtv;      /* per-thread DTV */
     tcb[2]=(uint64_t)(uintptr_t)t;           /* tcb_thread */
-    t->tls_block=block; t->tcb=tcb;
+    t->tls_block=block; t->tls_bytes=total; t->tcb=tcb;
     set_gs(tcb);
     current=t;
+    pthread_once(&cleanup_once,initialize_cleanup);
+    if (pthread_setspecific(cleanup_key,t)) { fputs("STOP: cannot register guest thread cleanup\n",stderr); exit(21); }
+}
+void *runtime_thread_tcb(void) { return current ? current->tcb : NULL; }
+static void cleanup_thread(void *value) {
+    GuestThread *t=value;
+    if (!t || !t->tls_block) return;
+    runtime_thread_keys_cleanup(); /* guest destructors can still read TCB/module TLS */
+    runtime_tls_cleanup();
+    set_gs(NULL);
+#ifdef _WIN32
+    if (runtime_low_unmap(t->tls_block,t->tls_bytes)) { fputs("STOP: cannot release guest TLS\n",stderr); exit(21); }
+#else
+    free(t->tls_block);
+#endif
+    t->tls_block=NULL; t->tcb=NULL; current=NULL;
+    pthread_mutex_lock(&lock); t->finished=1; if (!t->host_owned) ++exited; pthread_mutex_unlock(&lock);
 }
 static GuestThread *new_thread(void) {
+#ifdef _WIN32
+    GuestThread *t=runtime_low_map(sizeof(*t),3);
+#else
     GuestThread *t=calloc(1,sizeof(*t));
+#endif
     if (!t) return NULL;
     t->attr=(ThreadAttr){.magic=ATTR_MAGIC,.policy=1,.prio=DEFAULT_PRIO,.stack=DEFAULT_STACK,.affinity=0x7f};
     return t;
@@ -124,8 +241,7 @@ static ThreadAttr *find_attr(ThreadAttr **slot) {
 }
 
 static ABI void *thread_self(void) { return runtime_thread_current(); }
-static ABI int32_t *guest_error(void) { return &guest_errno; }
-int32_t *runtime_errno(void) { return &guest_errno; }
+static ABI int32_t *guest_error(void) { return runtime_errno(); }
 
 static ABI int32_t attr_init(ThreadAttr **out) {
     if (!out) return ERR(22);
@@ -157,7 +273,10 @@ static ABI int32_t attr_get(void *thread,ThreadAttr **out) {
 }
 static ABI int32_t attr_set_stack(ThreadAttr **slot,uint64_t size) {
     ThreadAttr *a=find_attr(slot);
-    if (!a || size<16384) return ERR(22);
+    if (!a || size<16384 || size>SIZE_MAX-STACK_MARGIN) return ERR(22);
+#ifdef _WIN32
+    if (size>UINT32_MAX-STACK_MARGIN) return ERR(22);
+#endif
     a->stack=size; return 0;
 }
 static ABI int32_t attr_get_stack(ThreadAttr **slot,uint64_t *size) {
@@ -222,8 +341,8 @@ static void *host_start(void *p) {
     attach(t);
     set_host_name(t->name);
     if (!setjmp(t->exit_jump)) t->result=t->entry(t->argument);
-    runtime_thread_keys_cleanup();
-    pthread_mutex_lock(&lock); t->finished=1; ++exited; pthread_mutex_unlock(&lock);
+    cleanup_thread(t);
+    pthread_setspecific(cleanup_key,NULL);
     return t->result;
 }
 static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,void *argument,const char *name) {
@@ -240,9 +359,15 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
     uint64_t stack=t->attr.stack<MIN_STACK ? MIN_STACK : t->attr.stack;
     /* Stacks below 1 TiB as on PS4; guest code may pack stack addresses. */
     size_t stack_bytes=(size_t)stack+STACK_MARGIN;
+#ifdef _WIN32
+    /* winpthreads stores attr.stack but pthread_create does not use its address.
+       Use an OS-managed stack so Windows retains valid stack/exception bounds. */
+    pthread_attr_setstacksize(&host,stack_bytes);
+#else
     void *stack_memory=runtime_low_map(stack_bytes,PROT_READ|PROT_WRITE);
     if (stack_memory) pthread_attr_setstack(&host,stack_memory,stack_bytes);
     else pthread_attr_setstacksize(&host,stack_bytes);
+#endif
     publish(t);
     /* Publish the handle before the thread can run and inspect itself. */
     *out=t;
@@ -260,8 +385,10 @@ static ABI int32_t thread_create(GuestThread **out,ThreadAttr **attr,GuestEntry 
 static ABI int32_t thread_join(GuestThread *t,void **result) {
     if (!find_thread(t) || t->host_owned) return ERR(3);
     if (t==current) return ERR(11);
-    if (t->detached || t->joined) return ERR(22);
+    pthread_mutex_lock(&lock);
+    if (t->detached || t->joined) { pthread_mutex_unlock(&lock); return ERR(22); }
     t->joined=1;
+    pthread_mutex_unlock(&lock);
     void *value=NULL;
     int e=pthread_join(t->host,&value);
     if (e) { fprintf(stderr,"STOP: host pthread_join failed: %d\n",e); exit(21); }
@@ -271,8 +398,10 @@ static ABI int32_t thread_join(GuestThread *t,void **result) {
 }
 static ABI int32_t thread_detach(GuestThread *t) {
     if (!find_thread(t)) return ERR(3);
-    if (t->detached) return ERR(22);
+    pthread_mutex_lock(&lock);
+    if (t->detached || t->joined) { pthread_mutex_unlock(&lock); return ERR(22); }
     t->detached=1;
+    pthread_mutex_unlock(&lock);
     if (!t->host_owned) pthread_detach(t->host);
     return 0;
 }
@@ -353,9 +482,3 @@ void runtime_thread_report(void) {
     printf("Runtime: guest threads created=%zu, exited=%zu, joined=%zu\n",created,exited,joined_count);
     pthread_mutex_unlock(&lock);
 }
-#else
-uintptr_t runtime_thread_resolve(const char *name) { (void)name; return 0; }
-void runtime_thread_report(void) {}
-void runtime_thread_attach_main(void) {}
-void runtime_set_main_tls(const void *d,uint64_t f,uint64_t m,uint64_t a) { (void)d;(void)f;(void)m;(void)a; }
-#endif

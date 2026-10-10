@@ -10,8 +10,12 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <dlfcn.h>
 #include <execinfo.h>
+#endif
 #include <pthread.h>
 
 namespace BbWaitTrace {
@@ -36,6 +40,11 @@ std::mutex mutex;
 std::map<Key, Total> totals;
 
 std::string Describe(void* address) {
+#ifdef _WIN32
+    char text[32];
+    std::snprintf(text, sizeof(text), "%p", address);
+    return text;
+#else
     Dl_info info{};
     if (!dladdr(address, &info)) {
         char text[32];
@@ -55,6 +64,7 @@ std::string Describe(void* address) {
                                       static_cast<char*>(info.dli_fbase)));
     }
     return text;
+#endif
 }
 } // namespace
 
@@ -70,7 +80,11 @@ Scope::Scope() {
     if (!Enabled()) {
         return;
     }
+#ifdef _WIN32
+    depth = CaptureStackBackTrace(0, DWORD(std::size(frames)), frames, nullptr);
+#else
     depth = backtrace(frames, int(std::size(frames)));
+#endif
     start = std::chrono::steady_clock::now();
 }
 
@@ -85,7 +99,11 @@ Scope::~Scope() {
     for (int i = 0; i < Kept && Skip + i < depth; ++i) {
         key.frames[i] = frames[Skip + i];
     }
+#ifdef _WIN32
+    std::snprintf(key.thread.data(), key.thread.size(), "tid %lu", GetCurrentThreadId());
+#else
     pthread_getname_np(pthread_self(), key.thread.data(), key.thread.size());
+#endif
     std::scoped_lock lk{mutex};
     auto& total = totals[key];
     total.ns += ns;

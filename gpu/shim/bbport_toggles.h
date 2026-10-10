@@ -12,7 +12,7 @@ extern "C" std::uint64_t runtime_disabled_optimizations;
 /// Temporary experiment bits: the second number in BB_TOGGLE_FILE (runtime_memory.c).
 extern "C" std::uint64_t runtime_experiment_bits;
 /// Recovery point for speculative guest memory reads on this thread (runtime_memory.c).
-extern "C" __thread sigjmp_buf* runtime_fault_recover;
+#include "../../src/runtime_fault.h"
 
 namespace BbToggle {
 enum : std::uint64_t {
@@ -132,6 +132,7 @@ inline std::atomic<std::int64_t> hot_pages{0};
 /// Stall diagnostics (BB_FRAME_STATS): per-frame deltas printed for frames over 40 ms.
 inline std::atomic<std::uint64_t> images_registered{0};
 inline std::atomic<std::uint64_t> image_upload_bytes{0};
+inline std::atomic<std::uint64_t> image_refresh_bytes{0}; ///< image ranges examined, including skipped mips
 inline std::atomic<std::uint64_t> buffer_upload_bytes{0};
 inline std::atomic<int> gpu_thread_clock{-1}; ///< clockid_t of the GPU command thread
 inline std::atomic<std::uint64_t> draws{0}, dispatches{0}, submissions{0};
@@ -205,15 +206,8 @@ inline std::atomic<std::uint64_t> vram_idle_bytes{0}, vram_unmapped_bytes{0}, vr
 inline std::atomic<std::uint64_t> residency_chunk_count{0}, evacuations{0}, evac_kept_gpu{0}, evac_kept_other{0};
 /// Images the collector passed over (GPU-written, not evictable without memory pressure).
 inline std::atomic<std::uint64_t> gc_kept_images{0};
-struct WaitTimer {
-    std::atomic<std::uint64_t>& total;
-    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-    ~WaitTimer() {
-        total.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - start).count(),
-                        std::memory_order_relaxed);
-    }
-};
+// Preserve opt-in timing on Windows.
+using WaitTimer = Timer;
 /// GPU thread rusage, refreshed after each graphics submission.
 inline std::atomic<std::uint64_t> gpu_sys_us{0}, gpu_user_us{0}, gpu_invol_switches{0},
     gpu_vol_switches{0}, gpu_minor_faults{0};

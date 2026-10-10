@@ -1,4 +1,8 @@
 /* Independent backend smoke test: command submission and readback, no game graphics. */
+#ifdef _WIN32
+#define VK_NO_PROTOTYPES
+#include <windows.h>
+#endif
 #include <vulkan/vulkan.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -6,7 +10,96 @@
 #define CHECK(call) do { VkResult r = (call); if (r != VK_SUCCESS) { \
     fprintf(stderr, "Vulkan: %s returned %d\n", #call, r); exit(1); } } while (0)
 
+#ifdef _WIN32
+static PFN_vkAllocateCommandBuffers vkAllocateCommandBuffers;
+static PFN_vkAllocateMemory vkAllocateMemory;
+static PFN_vkBeginCommandBuffer vkBeginCommandBuffer;
+static PFN_vkBindBufferMemory vkBindBufferMemory;
+static PFN_vkCmdFillBuffer vkCmdFillBuffer;
+static PFN_vkCmdPipelineBarrier vkCmdPipelineBarrier;
+static PFN_vkCreateBuffer vkCreateBuffer;
+static PFN_vkCreateCommandPool vkCreateCommandPool;
+static PFN_vkCreateDevice vkCreateDevice;
+static PFN_vkCreateInstance vkCreateInstance;
+static PFN_vkDestroyBuffer vkDestroyBuffer;
+static PFN_vkDestroyCommandPool vkDestroyCommandPool;
+static PFN_vkDestroyDevice vkDestroyDevice;
+static PFN_vkDestroyInstance vkDestroyInstance;
+static PFN_vkEndCommandBuffer vkEndCommandBuffer;
+static PFN_vkEnumeratePhysicalDevices vkEnumeratePhysicalDevices;
+static PFN_vkFreeMemory vkFreeMemory;
+static PFN_vkGetBufferMemoryRequirements vkGetBufferMemoryRequirements;
+static PFN_vkGetDeviceQueue vkGetDeviceQueue;
+static PFN_vkGetPhysicalDeviceMemoryProperties vkGetPhysicalDeviceMemoryProperties;
+static PFN_vkGetPhysicalDeviceProperties vkGetPhysicalDeviceProperties;
+static PFN_vkGetPhysicalDeviceQueueFamilyProperties vkGetPhysicalDeviceQueueFamilyProperties;
+static PFN_vkMapMemory vkMapMemory;
+static PFN_vkQueueSubmit vkQueueSubmit;
+static PFN_vkQueueWaitIdle vkQueueWaitIdle;
+static PFN_vkUnmapMemory vkUnmapMemory;
+static int load_vulkan(void) {
+    HMODULE loader=LoadLibraryExW(L"vulkan-1.dll",NULL,LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!loader) { fputs("Vulkan: system vulkan-1.dll is unavailable\n",stderr); return 0; }
+    vkAllocateCommandBuffers=(PFN_vkAllocateCommandBuffers)(void *)GetProcAddress(loader,"vkAllocateCommandBuffers");
+    if (!vkAllocateCommandBuffers) { fputs("Vulkan: missing vkAllocateCommandBuffers\n",stderr); return 0; }
+    vkAllocateMemory=(PFN_vkAllocateMemory)(void *)GetProcAddress(loader,"vkAllocateMemory");
+    if (!vkAllocateMemory) { fputs("Vulkan: missing vkAllocateMemory\n",stderr); return 0; }
+    vkBeginCommandBuffer=(PFN_vkBeginCommandBuffer)(void *)GetProcAddress(loader,"vkBeginCommandBuffer");
+    if (!vkBeginCommandBuffer) { fputs("Vulkan: missing vkBeginCommandBuffer\n",stderr); return 0; }
+    vkBindBufferMemory=(PFN_vkBindBufferMemory)(void *)GetProcAddress(loader,"vkBindBufferMemory");
+    if (!vkBindBufferMemory) { fputs("Vulkan: missing vkBindBufferMemory\n",stderr); return 0; }
+    vkCmdFillBuffer=(PFN_vkCmdFillBuffer)(void *)GetProcAddress(loader,"vkCmdFillBuffer");
+    if (!vkCmdFillBuffer) { fputs("Vulkan: missing vkCmdFillBuffer\n",stderr); return 0; }
+    vkCmdPipelineBarrier=(PFN_vkCmdPipelineBarrier)(void *)GetProcAddress(loader,"vkCmdPipelineBarrier");
+    if (!vkCmdPipelineBarrier) { fputs("Vulkan: missing vkCmdPipelineBarrier\n",stderr); return 0; }
+    vkCreateBuffer=(PFN_vkCreateBuffer)(void *)GetProcAddress(loader,"vkCreateBuffer");
+    if (!vkCreateBuffer) { fputs("Vulkan: missing vkCreateBuffer\n",stderr); return 0; }
+    vkCreateCommandPool=(PFN_vkCreateCommandPool)(void *)GetProcAddress(loader,"vkCreateCommandPool");
+    if (!vkCreateCommandPool) { fputs("Vulkan: missing vkCreateCommandPool\n",stderr); return 0; }
+    vkCreateDevice=(PFN_vkCreateDevice)(void *)GetProcAddress(loader,"vkCreateDevice");
+    if (!vkCreateDevice) { fputs("Vulkan: missing vkCreateDevice\n",stderr); return 0; }
+    vkCreateInstance=(PFN_vkCreateInstance)(void *)GetProcAddress(loader,"vkCreateInstance");
+    if (!vkCreateInstance) { fputs("Vulkan: missing vkCreateInstance\n",stderr); return 0; }
+    vkDestroyBuffer=(PFN_vkDestroyBuffer)(void *)GetProcAddress(loader,"vkDestroyBuffer");
+    if (!vkDestroyBuffer) { fputs("Vulkan: missing vkDestroyBuffer\n",stderr); return 0; }
+    vkDestroyCommandPool=(PFN_vkDestroyCommandPool)(void *)GetProcAddress(loader,"vkDestroyCommandPool");
+    if (!vkDestroyCommandPool) { fputs("Vulkan: missing vkDestroyCommandPool\n",stderr); return 0; }
+    vkDestroyDevice=(PFN_vkDestroyDevice)(void *)GetProcAddress(loader,"vkDestroyDevice");
+    if (!vkDestroyDevice) { fputs("Vulkan: missing vkDestroyDevice\n",stderr); return 0; }
+    vkDestroyInstance=(PFN_vkDestroyInstance)(void *)GetProcAddress(loader,"vkDestroyInstance");
+    if (!vkDestroyInstance) { fputs("Vulkan: missing vkDestroyInstance\n",stderr); return 0; }
+    vkEndCommandBuffer=(PFN_vkEndCommandBuffer)(void *)GetProcAddress(loader,"vkEndCommandBuffer");
+    if (!vkEndCommandBuffer) { fputs("Vulkan: missing vkEndCommandBuffer\n",stderr); return 0; }
+    vkEnumeratePhysicalDevices=(PFN_vkEnumeratePhysicalDevices)(void *)GetProcAddress(loader,"vkEnumeratePhysicalDevices");
+    if (!vkEnumeratePhysicalDevices) { fputs("Vulkan: missing vkEnumeratePhysicalDevices\n",stderr); return 0; }
+    vkFreeMemory=(PFN_vkFreeMemory)(void *)GetProcAddress(loader,"vkFreeMemory");
+    if (!vkFreeMemory) { fputs("Vulkan: missing vkFreeMemory\n",stderr); return 0; }
+    vkGetBufferMemoryRequirements=(PFN_vkGetBufferMemoryRequirements)(void *)GetProcAddress(loader,"vkGetBufferMemoryRequirements");
+    if (!vkGetBufferMemoryRequirements) { fputs("Vulkan: missing vkGetBufferMemoryRequirements\n",stderr); return 0; }
+    vkGetDeviceQueue=(PFN_vkGetDeviceQueue)(void *)GetProcAddress(loader,"vkGetDeviceQueue");
+    if (!vkGetDeviceQueue) { fputs("Vulkan: missing vkGetDeviceQueue\n",stderr); return 0; }
+    vkGetPhysicalDeviceMemoryProperties=(PFN_vkGetPhysicalDeviceMemoryProperties)(void *)GetProcAddress(loader,"vkGetPhysicalDeviceMemoryProperties");
+    if (!vkGetPhysicalDeviceMemoryProperties) { fputs("Vulkan: missing vkGetPhysicalDeviceMemoryProperties\n",stderr); return 0; }
+    vkGetPhysicalDeviceProperties=(PFN_vkGetPhysicalDeviceProperties)(void *)GetProcAddress(loader,"vkGetPhysicalDeviceProperties");
+    if (!vkGetPhysicalDeviceProperties) { fputs("Vulkan: missing vkGetPhysicalDeviceProperties\n",stderr); return 0; }
+    vkGetPhysicalDeviceQueueFamilyProperties=(PFN_vkGetPhysicalDeviceQueueFamilyProperties)(void *)GetProcAddress(loader,"vkGetPhysicalDeviceQueueFamilyProperties");
+    if (!vkGetPhysicalDeviceQueueFamilyProperties) { fputs("Vulkan: missing vkGetPhysicalDeviceQueueFamilyProperties\n",stderr); return 0; }
+    vkMapMemory=(PFN_vkMapMemory)(void *)GetProcAddress(loader,"vkMapMemory");
+    if (!vkMapMemory) { fputs("Vulkan: missing vkMapMemory\n",stderr); return 0; }
+    vkQueueSubmit=(PFN_vkQueueSubmit)(void *)GetProcAddress(loader,"vkQueueSubmit");
+    if (!vkQueueSubmit) { fputs("Vulkan: missing vkQueueSubmit\n",stderr); return 0; }
+    vkQueueWaitIdle=(PFN_vkQueueWaitIdle)(void *)GetProcAddress(loader,"vkQueueWaitIdle");
+    if (!vkQueueWaitIdle) { fputs("Vulkan: missing vkQueueWaitIdle\n",stderr); return 0; }
+    vkUnmapMemory=(PFN_vkUnmapMemory)(void *)GetProcAddress(loader,"vkUnmapMemory");
+    if (!vkUnmapMemory) { fputs("Vulkan: missing vkUnmapMemory\n",stderr); return 0; }
+    /* The loader stays resident until process exit; device/instance are destroyed below. */
+    return 1;
+}
+#endif
 int vulkan_smoke(void) {
+#ifdef _WIN32
+    if (!load_vulkan()) return 1;
+#endif
     VkApplicationInfo app = {.sType=VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName="Bloodborne native probe", .apiVersion=VK_API_VERSION_1_0};
     VkInstanceCreateInfo ici = {.sType=VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo=&app};
     VkInstance instance; CHECK(vkCreateInstance(&ici, NULL, &instance));

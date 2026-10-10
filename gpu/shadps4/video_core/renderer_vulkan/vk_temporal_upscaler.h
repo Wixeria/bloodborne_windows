@@ -21,6 +21,7 @@
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
+#include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_fsr4.h"
 #include "video_core/texture_cache/image.h"
 
@@ -69,7 +70,15 @@ public:
     void OnDispatch(u64 cs_hash);
 
     /// Start of a frame in the command stream (display pass).
+    void SetGuestFrameTiming(std::shared_ptr<DlssgFrame> timing) {
+        guest_timing = std::move(timing);
+    }
+    void OnDisplayTiming();
+    std::shared_ptr<DlssgFrame> TakeFrameGenerationTiming() {
+        return std::exchange(fg_timing_completed, {});
+    }
     bool OnFrameStart();
+    void OnSceneStart();
     bool RasterScaling() const;
     /// bbport: LOD bias for scene materials, log2(render / output) while a reduced scene is
     /// upscaled (0 at native size, for TAA and without an upscaler).
@@ -126,12 +135,22 @@ public:
         u32 width, height;
     };
     bool DisplayOverride(VAddr address, Display& display);
+    /// Diagnostic readback also works for native guest display buffers (no upscaler).
+    void CaptureDisplay(const Display& display, vk::ImageLayout layout);
+    static void CaptureFrameGeneration(const Instance&, Scheduler&, const Display& final,
+                                       const Display& hudless, vk::ImageLayout final_layout);
+
+    std::shared_ptr<DlssgInput> TakeFrameGenerationInput() {
+        return std::exchange(fg_completed, {});
+    }
     /// BB_PRESENT_DUMP_TRIGGER: whether this presented frame is to be saved (consumes the trigger).
     bool PresentDumpDue();
     /// Saves `image` (General layout, 4 bytes a pixel) as present_<w>x<h> in BB_DUMP_DIR.
     void DumpPresented(vk::Image image, u32 width, u32 height, vk::Format format);
 
 private:
+    std::shared_ptr<DlssgInput> fg_pending, fg_completed;
+    std::shared_ptr<DlssgFrame> fg_timing, guest_timing, fg_timing_completed;
     /// bbport: views of guest images the upscaler reads, kept across frames: FSR 4 registers
     /// images by view in a registry of eight (a new view per frame filled it at Native AA).
     vk::ImageView CachedView(const VideoCore::Image& image, vk::Format format,
@@ -174,12 +193,6 @@ private:
     bool RecordReactive(vk::ImageView color_view);
     /// FSR 4 is selected, possible in this session (not BB_RENDER_RES) and has not failed.
     [[nodiscard]] bool UseFsr4() const;
-    /// bbport: DLSS selected and the bridge is ready (NVIDIA RTX, gpu/dlss_bridge).
-    [[nodiscard]] bool UseDlss() const;
-    /// Records DLSS into `cmdbuf` (output in General). `hdr`: linear scene color input.
-    bool RecordDlss(vk::CommandBuffer cmdbuf, const Dlss::Resource& color,
-                    const Dlss::Resource& depth, u32 w, u32 h, u32 ow, u32 oh, float frame_ms,
-                    bool hdr);
     /// Records FSR 4 into output_image; on a permanent failure FSR 3 takes over.
     bool RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image color, Fsr4Upscaler::Image depth,
                     u32 w, u32 h, u32 ow, u32 oh, float frame_ms);
@@ -262,8 +275,8 @@ private:
     bool resources_fsr4 = false;  ///< made for FSR 4 (no FSR 3 context)
     bool resources_taa = false;
     std::unique_ptr<Fsr4Upscaler> fsr4;
+    std::unique_ptr<DlssUpscaler> dlss; ///< NVIDIA devices only; records the FSR 4 frame
     bool fsr4_failed = false;
-    bool dlss_failed = false;
     VideoCore::UniqueImage motion_image;
     VideoCore::UniqueImage output_image;
     vk::UniqueImageView motion_view;

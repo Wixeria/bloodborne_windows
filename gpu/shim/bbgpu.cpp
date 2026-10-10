@@ -6,7 +6,12 @@
 #include "bbport_settings.h"
 #include "game_profile.h"
 #include "bbport_copy.h"
+#include "bbport_reflex_trace.h"
+#include "video_core/renderer_vulkan/vk_dlssg.h"
+
+#ifndef _WIN32
 #include <sys/resource.h>
+#endif
 #include "bbport_free_check.h"
 #include "bbport_toggles.h"
 #include <algorithm>
@@ -26,6 +31,9 @@
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/rdtsc.h"
+#ifdef _WIN32
+#include "common/ntapi.h"
+#endif
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/libs.h"
 #include "core/emulator_settings.h"
@@ -263,6 +271,9 @@ static void StartProfileWriter() {
 #endif
 
 extern "C" int bbgpu_init(const BbGpuConfig* config) {
+#ifdef _WIN32
+    Common::NtApi::Initialize();
+#endif
     BbSettings::Load();
     // What the translator knows about this game (games/), before anything asks for it.
     Game::Select(config->serial);
@@ -270,7 +281,13 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
     StartProfileWriter();
 #endif
     g_sdk_version = config->sdk_version;
-    if (config->user_dir) setenv("BB_GPU_USER_DIR", config->user_dir, 0);
+    if (config->user_dir && !std::getenv("BB_GPU_USER_DIR")) {
+#ifdef _WIN32
+        _putenv_s("BB_GPU_USER_DIR", config->user_dir);
+#else
+        setenv("BB_GPU_USER_DIR", config->user_dir, 0);
+#endif
+    }
     Core::Emulator::FillElfInfo(*config);
     const std::string title = config->title ? config->title : "Bloodborne";
     const s32 width = config->width, height = config->height;
@@ -338,6 +355,9 @@ extern "C" void bbgpu_patch_image(unsigned char* image, uint64_t size) {
     BbGnmHooks::PatchImage(image, size);
     BbGameMenu::PatchImage(image, size);
 }
+extern "C" void bbgpu_reflex_window_message(uint32_t message) {
+    Vulkan::Dlssg::WindowMessage(message);
+}
 
 extern "C" unsigned bbgpu_symbol_count(void) {
     return unsigned(g_symbols.size());
@@ -396,6 +416,10 @@ ScreenshotRequests ConsumeScreenshotRequests() { return {}; }
 
 extern "C" int bbgpu_overlay_captures_input(void) {
     return BbOverlay::CapturesInput() ? 1 : 0;
+}
+extern "C" void bbgpu_reflex_input_sample(uintptr_t caller) {
+    BbReflexTrace::Event("input", caller);
+    Vulkan::Dlssg::GuestInputSample();
 }
 
 extern "C" int bbgpu_text_input_begin(const char* initial, const char* prompt) {

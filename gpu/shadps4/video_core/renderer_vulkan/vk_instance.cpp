@@ -19,6 +19,8 @@
 
 #include <vk_mem_alloc.h>
 
+#include "video_core/renderer_vulkan/vk_dlssg.h"
+
 namespace Vulkan {
 
 namespace {
@@ -204,6 +206,7 @@ Instance::Instance(const Frontend::WindowSystemInfo& window_info, s32 physical_d
 
 Instance::~Instance() {
     ImGui::Core::Shutdown(GetDevice());
+    Dlssg::Shutdown();
     vmaDestroyAllocator(allocator);
 }
 
@@ -399,6 +402,11 @@ bool Instance::CreateDevice() {
         compute_shader_derivatives_features =
             feature_chain.get<vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>();
     }
+    // bbport: NVIDIA NGX (DLSS) needs these besides push descriptors and buffer device address
+    // (NVSDK_NGX_VULKAN_RequiredExtensions); only NVIDIA drivers expose them.
+    const bool nvx_binary_import = add_extension(VK_NVX_BINARY_IMPORT_EXTENSION_NAME);
+    dlss_extensions =
+        add_extension(VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME) && nvx_binary_import;
     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     if (shader_clock) {
         shader_clock_features = feature_chain.get<vk::PhysicalDeviceShaderClockFeaturesKHR>();
@@ -459,18 +467,6 @@ bool Instance::CreateDevice() {
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
-    // bbport: DLSS (optional bridge library) needs its own device extensions on NVIDIA GPUs.
-    std::vector<const char*> dlss_extensions;
-    if (Dlss* dlss = Dlss::Get()) {
-        dlss->AppendDeviceExtensions(*instance, physical_device, dlss_extensions);
-        for (const char* name : dlss_extensions) {
-            if (std::none_of(enabled_extensions.begin(), enabled_extensions.end(),
-                             [&](const char* e) { return std::string_view{e} == name; }) &&
-                enabled_extensions.size() < enabled_extensions.capacity()) {
-                enabled_extensions.push_back(name);
-            }
-        }
-    }
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
             .queueCreateInfoCount = queue_info_count,
@@ -708,9 +704,6 @@ bool Instance::CreateDevice() {
     device = std::move(dev);
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
-    if (Dlss* dlss = Dlss::Get()) {
-        dlss->Initialize(*instance, physical_device, *device);
-    }
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
@@ -979,6 +972,25 @@ u64 Instance::GetDeviceMemoryBudgetNow() const {
         total_budget += memory_budget_props.heapBudget[heap];
     }
     return VramLimit() != 0 ? std::min(total_budget, VramLimit()) : total_budget;
+}
+
+Instance::MemorySnapshot Instance::GetMemorySnapshot() const {
+    vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    vk::PhysicalDeviceMemoryProperties2 props{.pNext = &budget};
+    physical_device.getMemoryProperties2(&props);
+    MemorySnapshot result;
+    for (u32 heap = 0; heap < props.memoryProperties.memoryHeapCount; ++heap) {
+        const bool local = bool(props.memoryProperties.memoryHeaps[heap].flags &
+                                vk::MemoryHeapFlagBits::eDeviceLocal);
+        if (IsIntegrated() || local) {
+            result.usage += budget.heapUsage[heap];
+            result.budget += budget.heapBudget[heap];
+        } else {
+            result.host_usage += budget.heapUsage[heap];
+            result.host_budget += budget.heapBudget[heap];
+        }
+    }
+    return result;
 }
 
 vk::FormatFeatureFlags2 Instance::GetFormatFeatureFlags(vk::Format format) const {

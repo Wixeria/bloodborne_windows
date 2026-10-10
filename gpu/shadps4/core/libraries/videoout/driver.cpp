@@ -7,11 +7,17 @@
 #include <chrono>
 #include <cstdio>
 #include <time.h>
+#ifndef _WIN32
 #include <sys/resource.h>
-#include <cstring>
 #include <dirent.h>
 #include <unistd.h>
+#else
+#include <windows.h>
+#include <psapi.h>
+#endif
+#include <cstring>
 #include "common/assert.h"
+#include "common/io_file.h"
 #include "bbport_toggles.h"
 #include "bbport_heap_sites.h"
 #include "bbport_wait_trace.h"
@@ -41,6 +47,7 @@ extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 namespace Vulkan {
 extern std::atomic<u64> g_bb_compile_ns;
 extern std::atomic<u32> g_bb_compiles;
+extern std::atomic<u64> g_bb_total_compile_ns, g_bb_total_compiles;
 } // namespace Vulkan
 
 namespace Libraries::VideoOut {
@@ -303,7 +310,10 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
 /// DRM clients, RSS) and the parts we know of. GTT holds the game's direct memory (fixed).
 static void PrintMemory() {
     u64 vram_kib = 0, gtt_kib = 0;
+#ifndef _WIN32
     std::vector<u64> clients;
+#endif
+#ifndef _WIN32
     if (DIR* dir = opendir("/proc/self/fdinfo")) {
         while (const dirent* entry = readdir(dir)) {
             char path[64];
@@ -339,6 +349,12 @@ static void PrintMemory() {
         std::fclose(statm);
     }
     const u64 rss = u64(rss_pages) * u64(sysconf(_SC_PAGESIZE));
+#else
+    PROCESS_MEMORY_COUNTERS_EX process{};
+    process.cb = sizeof(process);
+    GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&process), sizeof(process));
+    const u64 rss = process.WorkingSetSize;
+#endif
     const u64 device = BbStats::device_alloc_bytes.load() - BbStats::device_free_bytes.load();
     u64 vma_blocks = 0, vma_used = 0;
     Vulkan::VmaDeviceUsage(vma_blocks, vma_used);
@@ -376,6 +392,47 @@ void VideoOutDriver::Flip(const Request& req) {
     Vulkan::FrameCapture::OnFlip(req.index >= 0 ? req.port->buffer_slots[req.index].address_left
                                                 : 0);
 
+    // bbport: opt-in raw guest flip intervals for repeatable route profiles.
+    // Buffer writes and flush once a second; never open a file in normal play.
+    static Common::FS::IOFile frame_csv = [] {
+        const char* path = std::getenv("BB_FRAME_CSV");
+        if (!path || !*path) return Common::FS::IOFile{};
+        Common::FS::IOFile file{std::string{path}, Common::FS::FileAccessMode::Create};
+        if (file.IsOpen()) {
+            file.WriteString(std::string_view{"clock_ns,frame_ms,image_upload_bytes,buffer_upload_bytes,draws,compiles,compile_ns,image_refresh_bytes\n"});
+        } else {
+            std::fprintf(stderr, "Frame CSV: cannot create %s\n", path);
+        }
+        return file;
+    }();
+    if (frame_csv.IsOpen()) {
+        using Clock = std::chrono::steady_clock;
+        const auto now = Clock::now();
+        static auto last = now, last_flush = now;
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+        const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+        char row[256];
+        const int length = std::snprintf(row, sizeof(row), "%lld,%.6f,%llu,%llu,%llu,%llu,%llu,%llu\n",
+            static_cast<long long>(ns), ms,
+            static_cast<unsigned long long>(BbStats::image_upload_bytes.load()),
+            static_cast<unsigned long long>(BbStats::buffer_upload_bytes.load()),
+            static_cast<unsigned long long>(BbStats::draws.load()),
+            static_cast<unsigned long long>(Vulkan::g_bb_total_compiles.load()),
+            static_cast<unsigned long long>(Vulkan::g_bb_total_compile_ns.load()),
+            static_cast<unsigned long long>(BbStats::image_refresh_bytes.load()));
+        static std::string pending_rows;
+        if (length > 0 && static_cast<size_t>(length) < sizeof(row)) {
+            pending_rows.append(row, static_cast<size_t>(length));
+        }
+        // IOFile flushes each WriteString; batch rows before calling it.
+        if (now - last_flush >= std::chrono::seconds{1} || pending_rows.size() >= 32768) {
+            frame_csv.WriteString(std::string_view{pending_rows});
+            pending_rows.clear();
+            last_flush = now;
+        }
+        last = now;
+    }
+
     // bbport: BB_FRAME_STATS=1 prints flip rate and frame time spread every 5 seconds.
     static const bool frame_stats = EmulatorSettingsImpl::Flag("BB_FRAME_STATS", false);
     if (frame_stats) {
@@ -411,9 +468,16 @@ void VideoOutDriver::Flip(const Request& req) {
         last_twf = twf;
         const u64 copy_ns = BbStats::t_copy.load(), copy_bytes = BbStats::copy_bytes.load();
         u64 proc_flt = 0;
+#ifdef _WIN32
+        PROCESS_MEMORY_COUNTERS usage{};
+        if (GetProcessMemoryInfo(GetCurrentProcess(), &usage, sizeof(usage))) {
+            proc_flt = usage.PageFaultCount;
+        }
+#else
         if (rusage usage{}; getrusage(RUSAGE_SELF, &usage) == 0) {
             proc_flt = usage.ru_minflt;
         }
+#endif
         const u64 t_now[6] = {BbStats::t_resident.load(), BbStats::t_protect.load(),
                               BbStats::t_image_create.load(), BbStats::t_refresh.load(),
                               BbStats::t_staging.load(), BbStats::t_host_wait.load()};
@@ -423,11 +487,15 @@ void VideoOutDriver::Flip(const Request& req) {
                   user_us = BbStats::gpu_user_us.load(), invol = BbStats::gpu_invol_switches.load(),
                   vol = BbStats::gpu_vol_switches.load();
         u64 gpu_ns = 0;
+#ifdef _WIN32
+        gpu_ns = (BbStats::gpu_user_us.load() + BbStats::gpu_sys_us.load()) * 1000;
+#else
         if (const int clock = BbStats::gpu_thread_clock.load(); clock != -1) {
             timespec ts{};
             clock_gettime(static_cast<clockid_t>(clock), &ts);
             gpu_ns = u64(ts.tv_sec) * 1000000000ull + u64(ts.tv_nsec);
         }
+#endif
         const u64 images = BbStats::images_registered.load();
         const u64 image_bytes = BbStats::image_upload_bytes.load();
         const u64 buffer_bytes = BbStats::buffer_upload_bytes.load();
@@ -865,13 +933,20 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     // it arrives and its slot allows (no limit: at once), between vblanks, instead of on the
     // next vblank tick.
     const bool immediate_flips = frame_limit != 0 || EmulatorSettings.IsUncappedVblank();
+    auto next_vblank = std::chrono::steady_clock::now();
 
     while (!token.stop_requested()) {
         timer.Start();
-        const auto tick_deadline = std::chrono::steady_clock::now() + vblank_period;
+        const auto tick_start = std::chrono::steady_clock::now();
+        // Immediate flips do not use AccurateTimer::End. Anchor their vblank slots so
+        // event processing and late wakeups do not extend every guest tick. After a
+        // long stall, discard accumulated backlog instead of bursting missed ticks.
+        next_vblank = std::max(next_vblank + vblank_period, tick_start);
+        const auto tick_deadline = next_vblank;
 
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();
+            next_vblank = std::chrono::steady_clock::now();
             timer.End();
             continue;
         }
@@ -924,6 +999,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         }
 
         if (!immediate_flips || main_port.flip_rate != 0) {
+            next_vblank = std::chrono::steady_clock::now();
             timer.End();
             continue;
         }
@@ -939,7 +1015,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 if (next_flip >= tick_deadline) {
                     break;
                 }
-                std::this_thread::sleep_until(next_flip);
+                Common::SleepUntil(next_flip);
             }
             const auto now = std::chrono::steady_clock::now();
             const auto request = receive_request();
@@ -949,7 +1025,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 FRAME_END;
             }
         }
-        std::this_thread::sleep_until(tick_deadline);
+        Common::SleepUntil(tick_deadline);
     }
 }
 

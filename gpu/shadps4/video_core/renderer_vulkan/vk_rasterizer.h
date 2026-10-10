@@ -152,6 +152,8 @@ public:
                        const char* function = __builtin_FUNCTION());
     /// Runs `task(rasterizer, copy of data)` in order with the draws: on the draw recording
     /// thread while the draw pipeline is in use (PipelinedTasks), else here after a drain.
+    void SetReflexFrame(const std::shared_ptr<DlssgFrame>& timing);
+
     using OrderedTask = void (*)(Rasterizer& rasterizer, const u8* data);
     /// Returns true when the task was handed to the recording thread (not run yet).
     /// `reads_guest_memory`: the task may read guest memory (a CPU write on stage A over memory
@@ -251,7 +253,9 @@ public:
     static bool HonestLabels();
     /// The GPU command thread or the draw recording thread (fault handling runs inline there).
     bool IsGpuSideThread() const;
+#ifdef __linux__
     bool IsGpuSideThreadId(u32 tid) const;
+#endif
     /// A guest write hit a protected page.
     /// `guest_rip`: the guest instruction that wrote (0: unknown), see BufferCache::NoteCpuWrite.
     bool OnWriteFault(VAddr addr, bool assume_locks, u64 guest_rip = 0);
@@ -454,6 +458,7 @@ private:
     bool motion_draw = false;
     u64 motion_geometry{};    ///< vertex-stream identity of the current direct draw
     bool gbuffer_draw = false;
+    std::shared_ptr<DlssgFrame> queued_reflex_frame; // decoder thread only
     std::unique_ptr<TemporalUpscaler> upscaler; // bbport: FSR (docs/upscaler.md)
     std::array<float, 2> draw_jitter{};         ///< viewport offset of the current draw, pixels
     std::array<float, 2> target_scale{1.0f, 1.0f}; ///< pass drawn into the upscaler's output-size images

@@ -229,7 +229,6 @@ static constexpr const BinaryInfo& SearchBinaryInfo(const u32* code) {
             return *info;
         }
     }
-    constexpr u32 signature_size = sizeof(BinaryInfo::signature_ref) / sizeof(u8);
     constexpr u32 search_limit = 0x4000;
     const u32* end = code + search_limit;
     for (const u32* it = code; it < end; ++it) {

@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#ifndef _WIN32
 #include <dlfcn.h>
+#else
+#include <windows.h>
+#endif
 #include <map>
 #include <unordered_set>
 #include <xxhash.h>
@@ -836,7 +840,7 @@ void Rasterizer::DrainDrawPipe(u32 reason, u32 line, const char* function) {
     if (!draw_pipe || !OnStageA()) {
         return;
     }
-    static const bool stats = std::getenv("BB_FRAME_STATS") != nullptr;
+    const bool stats = BbStats::enabled;
     if (!stats) {
         draw_pipe->Drain(reason);
         return;
@@ -852,6 +856,7 @@ bool Rasterizer::IsGpuSideThread() const {
     return OnStageA() || DrawPipe::OnStageB();
 }
 
+#ifdef __linux__
 bool Rasterizer::IsGpuSideThreadId(u32 tid) const {
     // The userfaultfd thread handles the fault while the faulting thread waits: without locks
     // only if that thread owns the caches. The GPU command thread does not while the draw
@@ -861,6 +866,7 @@ bool Rasterizer::IsGpuSideThreadId(u32 tid) const {
     }
     return tid == liverpool->GetGpuCommandProcessorThreadId();
 }
+#endif
 
 void Rasterizer::NotePendingGpuWrite(VAddr address, u64 size) {
     if (!draw_pipe || !size) {
@@ -1026,10 +1032,9 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
     }
     std::array<u16, AmdGpu::RegDirty::NumBlocks> blocks;
     u32 num_blocks = 0;
-    for (size_t block = dirty.blocks._Find_first(); block < dirty.blocks.size();
-         block = dirty.blocks._Find_next(block)) {
+    dirty.ForEachBlock([&](size_t block) {
         blocks[num_blocks++] = static_cast<u16>(block);
-    }
+    });
     const auto stages =
         pipeline ? pipeline->GetStages() : std::span<const Shader::Info* const>{};
     // Constants: copied here into the ring, the recording thread only binds them.
@@ -1261,6 +1266,20 @@ void Rasterizer::RetireSubmission() {
     }
 }
 
+void Rasterizer::SetReflexFrame(const std::shared_ptr<DlssgFrame>& timing) {
+    if (queued_reflex_frame == timing) return;
+    queued_reflex_frame = timing;
+    // Own the token until stage B reaches this point. One handoff per guest
+    // frame, in order with draws, without draining the draw pipe per batch.
+    auto* payload = new std::shared_ptr<DlssgFrame>(timing);
+    RunInOrder([](Rasterizer& self, const u8* data) {
+        std::shared_ptr<DlssgFrame>* value;
+        std::memcpy(&value, data, sizeof(value));
+        self.upscaler->SetGuestFrameTiming(std::move(*value));
+        delete value;
+    }, &payload, sizeof(payload));
+}
+
 bool Rasterizer::RunInOrder(OrderedTask task, const void* data, u32 size, u64 toggle,
                             bool reads_guest_memory) {
     if (!UseDrawPipe() || BbToggle::Disabled(toggle)) {
@@ -1364,8 +1383,8 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
             std::memcpy(flat.data(), snapshot.user_data,
                         std::min(snapshot.user_data_size, snapshot.flat_size) * sizeof(u32));
             // Pointers in the tables may be stale by now: a fault only skips the check.
-            sigjmp_buf recover;
-            if (sigsetjmp(recover, 0)) {
+            BbFaultBuffer recover;
+            if (bb_fault_setjmp(recover)) {
                 runtime_fault_recover = nullptr;
                 continue;
             }
@@ -1440,7 +1459,7 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
 }
 
 void Rasterizer::PrintPipeStats() {
-    static const bool stats = std::getenv("BB_FRAME_STATS") != nullptr;
+    const bool stats = BbStats::enabled;
     if (!stats || (draw_pipe->packets & 1023) != 0) {
         return;
     }
@@ -1498,12 +1517,22 @@ void Rasterizer::PrintPipeStats() {
         std::printf("\n  stage B tasks (us per frame-second, count/s):");
         static std::array<u64, TaskKinds> last_task_cycles{}, last_task_counts{};
         for (std::size_t k = 0; k < TaskKinds && task_kinds[k]; ++k) {
+            u64 module_base = 0;
+#ifdef _WIN32
+            HMODULE module{};
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                  GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                  reinterpret_cast<LPCWSTR>(task_kinds[k]), &module))
+                module_base = reinterpret_cast<u64>(module);
+#else
             Dl_info info{};
             dladdr(task_kinds[k], &info);
+            module_base = reinterpret_cast<u64>(info.dli_fbase);
+#endif
             char name[32];
             std::snprintf(name, sizeof(name), "+0x%llx",
                           (unsigned long long)(reinterpret_cast<u64>(task_kinds[k]) -
-                                               reinterpret_cast<u64>(info.dli_fbase)));
+                                               module_base));
             const u64 c = task_cycles[k], n = task_counts[k];
             std::printf(" [%s %.0f us/s %.0f/s]", name,
                         1e6 * double(c - last_task_cycles[k]) / tsc_hz / seconds,
@@ -1613,6 +1642,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     const auto& regs = Regs();
     // bbport: the pass copying a finished frame to a display buffer; the previous draw's
     // target is that frame.
+    if (regs.color_buffers[0] && FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address())) {
+        upscaler->OnDisplayTiming();
+    }
     if (camera_motion->Enabled() && regs.color_buffers[0] &&
         FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address())) {
         scene_started = false;
@@ -2406,7 +2438,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 
     bool uses_dma = false;
 
-    static const bool stats = std::getenv("BB_FRAME_STATS") != nullptr;
+    const bool stats = BbStats::enabled;
     if (stats && ((helper_full + helper_partial + helper_serial) & 1023) == 0) {
         static auto window = std::chrono::steady_clock::now();
         const auto now = std::chrono::steady_clock::now();
@@ -3747,8 +3779,11 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     std::pair<vk::ImageView, vk::ImageLayout> original_color{};
     const auto& regs = Regs();
     const auto& key = pipeline->GetGraphicsKey();
-    if (std::popcount(key.mrt_mask & 0x7f) >= 5 && db_desc.first &&
-        scene_targets->EligibleScene(texture_cache.GetImage(db_desc.first))) scene_started = true;
+    if (!scene_started && std::popcount(key.mrt_mask & 0x7f) >= 5 && db_desc.first &&
+        scene_targets->EligibleScene(texture_cache.GetImage(db_desc.first))) {
+        upscaler->OnSceneStart();
+        scene_started = true;
+    }
     // A proxy attachment cannot represent MSAA or a feedback loop that reads the
     // same image through the guest's native descriptor during this draw.
     bool reduced = scene_started && upscaler->RasterScaling() && key.num_samples == 1;

@@ -4,18 +4,22 @@
 #include <stdexcept>
 #include "common/assert.h"
 #include "common/logging/log.h"
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 // bb-probe (probe.c): set while the port restarts itself through run.sh. The device fd is closed
 // before exec; Vulkan calls failing then are not errors: this thread waits for the exec instead.
 extern "C" __attribute__((weak)) volatile int runtime_restarting; // absent in the tests
 
 void assert_fail_impl() {
+#ifndef _WIN32
     if (&runtime_restarting && runtime_restarting) {
         for (;;) {
             pause();
         }
     }
+#endif
     std::fflush(stdout);
     std::fputs("STOP: GPU library assertion failed (see GPU log above)\n", stderr);
     std::_Exit(23);

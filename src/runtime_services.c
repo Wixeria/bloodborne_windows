@@ -10,10 +10,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifndef _WIN32
 #include <pthread.h>
 #include <time.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
+#endif
 
 #define USER_ID 1
 #define ORBIS_OK 0
@@ -74,7 +78,16 @@ static ABI int32_t system_param(int32_t id,int32_t *value) {
     case 1: *value=language(); break;           /* language (1 = English US, 8 = Russian) */
     case 2: *value=1; break;                    /* date format DD/MM/YYYY */
     case 3: *value=1; break;                    /* 24-hour clock */
-    case 4: { time_t now=time(NULL); struct tm t; localtime_r(&now,&t); *value=(int32_t)(t.tm_gmtoff/60); break; }
+    case 4: {
+#ifdef _WIN32
+        TIME_ZONE_INFORMATION zone; DWORD state=GetTimeZoneInformation(&zone);
+        if (state==TIME_ZONE_ID_INVALID) return SYSTEM_PARAMETER;
+        *value=-(zone.Bias+(state==TIME_ZONE_ID_DAYLIGHT ? zone.DaylightBias : zone.StandardBias));
+#else
+        time_t now=time(NULL); struct tm t; localtime_r(&now,&t); *value=(int32_t)(t.tm_gmtoff/60);
+#endif
+        break;
+    }
     case 5: *value=0; break;                    /* summer time */
     case 7: *value=0; break;                    /* parental level off */
     case 1000: *value=1; break;                 /* enter button = cross */
@@ -173,8 +186,7 @@ static ABI int32_t voice_info(uint32_t port,uint32_t *info) {
 typedef struct { const char *name; int initialized, status; } Dialog;
 static Dialog dialogs[]={{"CommonDialog",0,0},{"MsgDialog",0,0},{"SaveDataDialog",0,0},
                          {"NpProfileDialog",0,0},{"NpCommerceDialog",0,0},{"ImeDialog",0,0}};
-static int common_initialized;
-static ABI int32_t common_init(void) { common_initialized=1; return 0; }
+static ABI int32_t common_init(void) { return 0; }
 static int32_t dialog_init(int i) {
     if (dialogs[i].initialized) return (int32_t)0x80B80004;
     dialogs[i].initialized=1; dialogs[i].status=1; return 0;
@@ -468,6 +480,3 @@ static const RuntimeExport exports[]={
     {"sceVoiceInit",ok_void}, {"sceVoiceEnd",ok_void},
 };
 uintptr_t runtime_services_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
-#else
-uintptr_t runtime_services_resolve(const char *name) { (void)name; return 0; }
-#endif

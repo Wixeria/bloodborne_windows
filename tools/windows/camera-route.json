@@ -1,0 +1,7 @@
+[
+  {"seconds": 4, "pad": ""},
+  {"seconds": 3, "pad": "rx=255"},
+  {"seconds": 2, "pad": ""},
+  {"seconds": 3, "pad": "rx=0"},
+  {"seconds": 8, "pad": ""}
+]

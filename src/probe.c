@@ -5,14 +5,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
+#include <errno.h>
 #include <cpuid.h>
 #include "runtime.h"
+#include "runtime_thread.h"
+#include "runtime_memory.h"
+#include "runtime_host_fs.h"
 #include "gpu/bbgpu.h"
 #if !defined(__x86_64__) || !defined(__GNUC__)
 #error This prototype requires x86-64 GCC or Clang (including MinGW).
 #endif
 #ifdef _WIN32
 #include <windows.h>
+#include <unistd.h>
+#include <errno.h>
 #else
 #include <sys/mman.h>
 #include <malloc.h>
@@ -31,7 +37,8 @@ typedef struct { uint64_t address, size, flags; } Segment;
 typedef struct { uint64_t target, kind, value, addend; } Reloc;
 static char (*names)[128];
 static uint64_t import_count;
-static unsigned char *image;
+static unsigned char *image, *data_traps;
+static uint64_t image_size;
 static size_t page_size;
 typedef struct { uint64_t base, size, init, tls_address, tls_memsz, tls_filesz, tls_module; } LinkedModule;
 static LinkedModule modules[16];
@@ -40,8 +47,7 @@ static int entered_game;
 static int gpu_enabled;
 int vulkan_smoke(void);
 
-static void fail(const char *message) { fprintf(stderr, "ERROR: %s\n", message); exit(1); }
-
+static __attribute__((noreturn)) void fail(const char *message) { fprintf(stderr, "ERROR: %s\n", message); exit(1); }
 /* The game's code was compiled for the PS4's CPU (AMD Jaguar) and runs as it is: AVX, BMI1
  * (andn/bextr/blsr/tzcnt), MOVBE, LZCNT and POPCNT, thousands of each in eboot.bin. A CPU without
  * them stops at the first one with SIGILL (exit code 132, issue #26), and lzcnt/tzcnt even run as
@@ -86,17 +92,8 @@ static uint64_t read64(FILE *f) {
 }
 static size_t round_page(size_t size) { return (size + page_size - 1) & ~(page_size - 1); }
 static void *allocate(size_t size) {
-#ifndef _WIN32
-    void *low=runtime_low_map(size,PROT_READ|PROT_WRITE);
-    if (low) return low;
-#endif
-#ifdef _WIN32
-    void *p = VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    if (!p) fail("VirtualAlloc failed");
-#else
-    void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p == MAP_FAILED) fail("mmap failed");
-#endif
+    void *p=runtime_low_map(size,3); /* host read/write, always in the guest's 40-bit range */
+    if (!p) fail("cannot allocate low guest memory");
     return p;
 }
 static void protect(void *p, size_t size, unsigned flags) {
@@ -156,7 +153,7 @@ static void fault(int sig, siginfo_t *info, void *context) {
     uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
     char line[512];
     Dl_info where;
-    if (rip - (uintptr_t)image < 0x10000000)
+    if (rip - (uintptr_t)image < image_size)
         snprintf(line, sizeof(line), "Guest fault (signal %d) at guest offset 0x%lx, address %p\n",
                  sig, (unsigned long)(rip - (uintptr_t)image), info->si_addr);
     else if (dladdr((void *)rip, &where) && where.dli_fname)
@@ -200,6 +197,7 @@ static void fault(int sig, siginfo_t *info, void *context) {
     _exit(128 + sig);
 }
 #endif
+#ifndef _WIN32
 /* Watchdog: dump RIP and the rbp frame chain of every thread (guest offsets
  * when inside the image). Reads use process_vm_readv so bad frames cannot fault. */
 static uintptr_t exe_base;
@@ -245,9 +243,78 @@ static void watchdog(int sig, siginfo_t *info, void *context) {
     usleep(100000);
     _exit(128 + sig);
 }
+#else
+/* Native TEB/SEH state stays intact while guest code runs on the OS stack. */
+static LONG CALLBACK windows_fault(EXCEPTION_POINTERS *exception) {
+    DWORD code=exception->ExceptionRecord->ExceptionCode;
+    int access=code==EXCEPTION_ACCESS_VIOLATION || code==EXCEPTION_IN_PAGE_ERROR;
+    if (!access && code!=EXCEPTION_ILLEGAL_INSTRUCTION && code!=EXCEPTION_PRIV_INSTRUCTION &&
+        code!=EXCEPTION_INT_DIVIDE_BY_ZERO && code!=EXCEPTION_STACK_OVERFLOW) return EXCEPTION_CONTINUE_SEARCH;
+    uintptr_t address=access && exception->ExceptionRecord->NumberParameters>=2 ?
+        exception->ExceptionRecord->ExceptionInformation[1] : 0;
+    if (access && gpu_enabled && bbgpu_handle_fault(exception,(void *)address))
+        return EXCEPTION_CONTINUE_EXECUTION;
+    if (access) bb_fault_try_recover();
+    uintptr_t rip=exception->ContextRecord->Rip;
+    fprintf(stderr,"STOP: %s fault, exception 0x%08lx, RIP=0x%" PRIxPTR ", address=0x%" PRIxPTR "\n",
+        rip>=(uintptr_t)image && rip-(uintptr_t)image<image_size ? "Guest" : "Host",code,rip,address);
+    if (image && rip>=(uintptr_t)image && rip-(uintptr_t)image<image_size)
+        fprintf(stderr,"Guest offset: 0x%" PRIxPTR "\n",rip-(uintptr_t)image);
+    else {
+        HMODULE module=NULL;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                (const char *)rip,&module)) {
+            char path[MAX_PATH];
+            if (GetModuleFileNameA(module,path,sizeof(path)))
+                fprintf(stderr,"Host module: %s +0x%" PRIxPTR "\n",path,rip-(uintptr_t)module);
+        }
+    }
+    if (data_traps && address>=(uintptr_t)data_traps &&
+        address-(uintptr_t)data_traps<import_count*page_size) {
+        size_t id=(address-(uintptr_t)data_traps)/page_size;
+        fprintf(stderr,"Unsupported data import: %s (%s)\n",names[id],runtime_import_name(names[id]));
+    }
+    if (gpu_enabled) bbgpu_dump_guest_writes(exception->ContextRecord);
+    fflush(NULL);
+    /* Fatal diagnostics must not run driver DLL detach code with guest/GPU
+       threads still holding locks. Flush above, then stop the whole process. */
+    TerminateProcess(GetCurrentProcess(),access ? 139 : code==EXCEPTION_INT_DIVIDE_BY_ZERO ? 136 : 132);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+static DWORD WINAPI windows_watchdog(void *argument) {
+    unsigned seconds=(unsigned)(uintptr_t)argument;
+    wchar_t stop_file[32768];
+    DWORD stop_length=GetEnvironmentVariableW(L"BB_STOP_FILE",stop_file,32768);
+    if (stop_length && stop_length < 32768) {
+        ULONGLONG start=GetTickCount64();
+        for (;;) {
+            DWORD attributes=GetFileAttributesW(stop_file);
+            if (attributes!=INVALID_FILE_ATTRIBUTES && !(attributes&FILE_ATTRIBUTE_DIRECTORY)) {
+                fputs("Profile: stop requested\n",stderr);
+                fflush(NULL);
+                /* Diagnostic copies only: stop all guest/driver threads without
+                   invoking DLL detach with their locks held. Not a game quit. */
+                TerminateProcess(GetCurrentProcess(),0);
+                return 0;
+            }
+            if (seconds && GetTickCount64()-start >= (ULONGLONG)seconds*1000) break;
+            Sleep(100);
+        }
+    }
+    /* Chunking also handles timeouts larger than the DWORD millisecond range. */
+    else while (seconds) {
+        unsigned part=seconds>3600 ? 3600 : seconds;
+        Sleep(part*1000); seconds-=part;
+    }
+    fputs("STOP: watchdog timeout; guest execution did not finish\n",stderr);
+    fflush(NULL);
+    TerminateProcess(GetCurrentProcess(),124);
+    return 124;
+}
+#endif
 /* param.sfo lookup: string or integer value of key, 0 when absent. */
 static int sfo_value(const char *path, const char *key, char *text, size_t text_size, uint32_t *number) {
-    FILE *f=fopen(path,"rb");
+    FILE *f=runtime_host_fopen(path,"rb");
     if (!f) return 0;
     unsigned char data[65536];
     size_t n=fread(data,1,sizeof(data),f); fclose(f);
@@ -258,11 +325,13 @@ static int sfo_value(const char *path, const char *key, char *text, size_t text_
         const unsigned char *e=data+20+i*16;
         uint16_t key_offset, format; uint32_t length, offset;
         memcpy(&key_offset,e,2); memcpy(&format,e+2,2); memcpy(&length,e+4,4); memcpy(&offset,e+12,4);
-        if (keys+key_offset>=n || values+offset+length>n || strcmp((const char *)data+keys+key_offset,key)) continue;
-        if (format==0x0404 && number && length>=4) { memcpy(number,data+values+offset,4); return 1; }
+        uint64_t key_at=(uint64_t)keys+key_offset, value_at=(uint64_t)values+offset;
+        if (key_at>=n || value_at>n || length>n-value_at ||
+            !memchr(data+key_at,0,n-key_at) || strcmp((const char *)data+key_at,key)) continue;
+        if (format==0x0404 && number && length>=4) { memcpy(number,data+value_at,4); return 1; }
         if (text && text_size) {
             size_t copy=length<text_size-1 ? length : text_size-1;
-            memcpy(text,data+values+offset,copy); text[copy]=0;
+            memcpy(text,data+value_at,copy); text[copy]=0;
         }
         return 1;
     }
@@ -278,7 +347,7 @@ static int mapped(Segment *segments, uint64_t count, uint64_t address, uint64_t 
  * after relocation. A write may replace a whole base-relative pointer slot (60/90 FPS++ swap
  * function pointers): the patch holds the address at the patches' base, rebased here. */
 static void apply_patches(const char *path, Segment *segments, uint64_t ns, const Reloc *relocs, uint64_t nr) {
-    FILE *f=fopen(path,"rb");
+    FILE *f=runtime_host_fopen(path,"rb");
     char magic[8];
     if (!f || fread(magic,1,8,f)!=8 || memcmp(magic,"BBPATCH2",8)) fail("invalid patch file");
     uint64_t base=read64(f), count=read64(f), bytes=0, rebased=0;
@@ -310,25 +379,9 @@ static void apply_patches(const char *path, Segment *segments, uint64_t ns, cons
     fclose(f);
     printf("Patches: %" PRIu64 " writes, %" PRIu64 " bytes applied, %" PRIu64 " pointers rebased\n",count,bytes,rebased);
 }
-/* Restarts the game through run.sh (the settings menu: a new render resolution is a patch
- * applied at start). Descriptors are closed first so the old GPU device and its memory are
- * released before the new process opens its own. */
-volatile int runtime_restarting;
-void runtime_restart(void) {
-    fflush(NULL);
-    puts("Runtime: restarting through run.sh");
-    /* The GPU threads still run until exec: their Vulkan calls fail once the device fd is
-     * closed below, and an assertion there must not end the process (exit 23) before exec. */
-    runtime_restarting = 1;
-    __sync_synchronize();
-#ifndef _WIN32
-    syscall(SYS_close_range, 3u, ~0u, 0u);
-    execlp("bash", "bash", "run.sh", (char *)NULL);
-    perror("runtime_restart: exec");
-    _exit(1);
+#ifdef _WIN32
+#define main probe_main
 #endif
-}
-
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
 #ifndef _WIN32
@@ -349,7 +402,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--app0") && i+1<argc) app0=argv[++i];
         else if (!strcmp(argv[i], "--user") && i+1<argc) user_dir=argv[++i];
         else if (!strcmp(argv[i], "--patches") && i+1<argc) patch_file=argv[++i];
-        else if (!strcmp(argv[i], "--timeout") && i+1<argc) timeout_seconds=(unsigned)strtoul(argv[++i],NULL,10);
+        else if (!strcmp(argv[i], "--timeout") && i+1<argc) {
+            char *end; errno=0;
+            unsigned long value=strtoul(argv[++i],&end,10);
+            if (errno || !*argv[i] || *argv[i]=='-' || *end || value>UINT32_MAX) fail("invalid timeout");
+            timeout_seconds=(unsigned)value;
+        }
         else { fprintf(stderr, "Unknown option: %s\n", argv[i]); return 1; }
     }
     if (argc < 2) {
@@ -357,7 +415,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (content_profile) {
-        FILE *profile=fopen(content_profile,"rb");
+        FILE *profile=runtime_host_fopen(content_profile,"rb");
         unsigned char data[28];
         if (!profile) fail("cannot open content profile");
         if (fread(data,1,sizeof(data),profile)!=sizeof(data) || fgetc(profile)!=EOF || memcmp(data,"BBCONT01",8)) fail("invalid content profile");
@@ -376,9 +434,16 @@ int main(int argc, char **argv) {
         if (sfo_value(sfo,"INSTALL_DIR_SAVEDATA",id,sizeof(id),NULL) || sfo_value(sfo,"TITLE_ID",id,sizeof(id),NULL))
             runtime_savedata_configure(id);
     }
+    runtime_thread_prepare_host();
     bbgpu_register_kernel();
 #ifdef _WIN32
     SYSTEM_INFO system_info; GetSystemInfo(&system_info); page_size = system_info.dwPageSize;
+    if (!AddVectoredExceptionHandler(1,windows_fault)) fail("cannot install exception handler");
+    if (timeout_seconds || GetEnvironmentVariableW(L"BB_STOP_FILE",NULL,0)>1) {
+        HANDLE watchdog=CreateThread(NULL,0,windows_watchdog,(void *)(uintptr_t)timeout_seconds,0,NULL);
+        if (!watchdog) fail("cannot start watchdog");
+        CloseHandle(watchdog);
+    }
 #else
     page_size = (size_t)sysconf(_SC_PAGESIZE);
     struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO;
@@ -392,7 +457,7 @@ int main(int argc, char **argv) {
     sigemptyset(&alarm_action.sa_mask); sigaction(SIGALRM, &alarm_action, NULL);
     alarm(timeout_seconds); /* 0 disables the watchdog */
 #endif
-    FILE *f = fopen(argv[1], "rb");
+    FILE *f = runtime_host_fopen(argv[1], "rb");
     if (!f) fail("cannot open boot file; run prepare.py first");
     char magic[8];
     if (fread(magic, 1, 8, f) != 8 || (memcmp(magic, "BBPROBE1", 8) && memcmp(magic, "BBPROBE2", 8) && memcmp(magic,"BBPROBE3",8) && memcmp(magic,"BBPROBE4",8) && memcmp(magic,"BBPROBE5",8))) fail("bad boot file signature");
@@ -403,6 +468,7 @@ int main(int argc, char **argv) {
     runtime_start(strict_imports ? 0 : capabilities);
     if (!size || size > 512*1024*1024 || entry >= size || !ns || ns > 64 || nr > 1000000 || import_count > 100000)
         fail("boot file limits exceeded");
+    image_size=size;
     int multi=!memcmp(magic,"BBPROBE5",8);
     int linked=!memcmp(magic,"BBPROBE3",8) || !memcmp(magic,"BBPROBE4",8) || multi;
     int native_libc=linked && !strict_imports && (capabilities&1);
@@ -460,8 +526,11 @@ int main(int argc, char **argv) {
         segments[i].address = read64(f);
         segments[i].size = read64(f);
         segments[i].flags = read64(f);
-        if (segments[i].address > size || segments[i].size > size - segments[i].address ||
+        if (!segments[i].size || segments[i].address > size || segments[i].size > size - segments[i].address ||
             segments[i].address % page_size || segments[i].flags > 7) fail("bad segment");
+        for (uint64_t j=0;j<i;++j)
+            if (segments[i].address<segments[j].address+round_page(segments[j].size) &&
+                segments[j].address<segments[i].address+round_page(segments[i].size)) fail("overlapping segments");
     }
     if (fread(names, 128, import_count, f) != import_count) fail("truncated import names");
     for (uint64_t i = 0; i < import_count; ++i)
@@ -473,11 +542,13 @@ int main(int argc, char **argv) {
         relocs[i].addend = read64(f);
         if (!mapped(segments, ns, relocs[i].target, 8) || relocs[i].kind > 2 ||
             (relocs[i].kind && relocs[i].value >= import_count) ||
+            (!relocs[i].kind && relocs[i].value>size) ||
             (relocs[i].kind != 2 && relocs[i].addend) || relocs[i].addend >= page_size) fail("bad relocation");
     }
     for (uint64_t m=0;m<module_count;++m)
         if (!mapped(segments,ns,modules[m].init,1) || (modules[m].tls_module && !mapped(segments,ns,modules[m].tls_address,modules[m].tls_memsz)))
             fail("unmapped module metadata");
+    if (main_tls[1] && !mapped(segments,ns,main_tls[0],main_tls[1])) fail("unmapped eboot TLS");
     if (module_count && !mapped(segments,ns,procparam,64)) fail("unmapped procparam");
     for (uint64_t i=0;i<import_count;++i) {
         if (!bindings[i]) continue;
@@ -508,7 +579,7 @@ int main(int argc, char **argv) {
         printf("GPU: window and Vulkan presenter ready; SDK 0x%08x, %u HLE symbols\n",(unsigned)sdk,bbgpu_symbol_count());
     }
     unsigned char *traps = allocate(round_page((import_count + 1) * 32));
-    unsigned char *data_traps = allocate((import_count + 1) * page_size);
+    data_traps = allocate((import_count + 1) * page_size);
     protect(data_traps, (import_count + 1) * page_size, 0);
     for (uint64_t i = 0; i < import_count; ++i) {
         unsigned char *t = traps + i * 32;
@@ -536,6 +607,12 @@ int main(int argc, char **argv) {
         memcpy(image + relocs[i].target, &value, 8);
     }
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
+#ifdef _WIN32
+    size_t tls_patches=0;
+    for (uint64_t i=0;i<ns;++i)
+        if (segments[i].flags&1) tls_patches+=runtime_thread_patch_tls_loads(image+segments[i].address,(size_t)segments[i].size);
+    printf("Windows TLS: %zu guest GS loads redirected to this process's TEB slot\n",tls_patches);
+#endif
     if (!cpu_only) bbgpu_patch_image(image, size);
     protect(traps, round_page((import_count + 1) * 32), 5);
     protect(image, round_page(size), 0);
@@ -547,6 +624,7 @@ int main(int argc, char **argv) {
     }
     if (!executable_entry) fail("entry is not executable");
     printf("Mapped %" PRIu64 " bytes, %" PRIu64 " segments; applied %" PRIu64 " relocations\n", size, ns, nr);
+    if (!native_libc) runtime_thread_attach_main();
     if (native_libc) {
         for (uint64_t m=0;m<module_count;++m) {
             int init_executable=0;
@@ -570,16 +648,38 @@ int main(int argc, char **argv) {
     }
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
     entered_game=1;
-    struct { uint64_t argc; const char *argv[2]; } params = {1, {"/app0/eboot.bin", NULL}};
+    struct EntryParams { uint64_t argc; const char *argv[2]; };
+    struct EntryParams *params=allocate(page_size);
+    char *argv0=(char *)(params+1);
+    strcpy(argv0,"/app0/eboot.bin");
+    *params=(struct EntryParams){1,{argv0,NULL}};
 #ifdef _WIN32
     typedef void (ABI *Entry)(void *, void (ABI *)(void));
-    ((Entry)(image + entry))(&params, guest_exit);
+    ((Entry)(image + entry))(params, guest_exit);
 #else
     /* The guest main thread runs on a stack below 1 TiB like PS4 stacks. */
     enum { MAIN_STACK=8*1024*1024 };
     unsigned char *stack=runtime_low_map(MAIN_STACK,PROT_READ|PROT_WRITE);
     if (!stack) fail("cannot allocate guest main stack");
-    enter_on_stack(image+entry,&params,(void *)guest_exit,stack+MAIN_STACK-64);
+    enter_on_stack(image+entry,params,(void *)guest_exit,stack+MAIN_STACK-64);
 #endif
     fail("entry unexpectedly returned");
 }
+
+#ifdef _WIN32
+#undef main
+/* Preserve UTF-8 host paths from PowerShell, including Turkish directory names. */
+int wmain(int argc,wchar_t **wide_argv) {
+    char **argv=calloc((size_t)argc+1,sizeof(*argv));
+    if (!argv) return 1;
+    for (int i=0;i<argc;++i) {
+        int size=WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,wide_argv[i],-1,NULL,0,NULL,NULL);
+        if (!size || !(argv[i]=malloc((size_t)size))) fail("cannot convert command-line arguments");
+        if (!WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,wide_argv[i],-1,argv[i],size,NULL,NULL))
+            fail("invalid Unicode command-line argument");
+    }
+    int result=probe_main(argc,argv);
+    for (int i=0;i<argc;++i) free(argv[i]);
+    free(argv); return result;
+}
+#endif

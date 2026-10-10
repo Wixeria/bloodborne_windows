@@ -168,7 +168,9 @@ Presenter::~Presenter() {
     Check(flip_scheduler.CommandBuffer().reset());
 
     const vk::Device device = instance.GetDevice();
+    Dlssg::Drain(instance);
     for (auto& frame : present_frames) {
+        frame.fg_input.reset();
         vmaDestroyImage(instance.GetAllocator(), frame.image, frame.allocation);
         device.destroyImageView(frame.image_view);
         device.destroyFence(frame.present_done);
@@ -332,6 +334,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     }
 
     Frame* frame = GetRenderFrame();
+    frame->fg_input = rasterizer->GetUpscaler().TakeFrameGenerationInput();
+    frame->reflex_timing = rasterizer->GetUpscaler().TakeFrameGenerationTiming();
 
     const auto frame_subresources = vk::ImageSubresourceRange{
         .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -401,6 +405,21 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // the post process pass still sRGB encoded and has to be decoded there instead.
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
+    const bool bgra = view_info.format == vk::Format::eB8G8R8A8Srgb ||
+                      view_info.format == vk::Format::eB8G8R8A8Unorm;
+    const auto scene = Dlssg::Scene(frame->fg_input, bgra);
+    Dlssg::Color clean{};
+    if (scene.image && !frame->is_hdr) {
+        // A separate host-filter ring keeps the extra HUDless render from consuming
+        // the normal presentation ring twice per frame.
+        if (!fg_fsr_pass) {
+            fg_fsr_pass = std::make_unique<HostPasses::FsrPass>();
+            fg_fsr_pass->Create(instance.GetDevice(), instance.GetAllocator(), present_frames.size());
+        }
+        clean =
+            Dlssg::HudlessTarget(instance, frame->fg_input, swapchain.GetSurfaceFormat().format,
+                                 frame->width, frame->height);
+    }
 
     // Numbered here, in command order; marked where the commands are recorded.
     const u32 stream = draw_scheduler.CrumbStream();
@@ -408,7 +427,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     const u32 fsr_crumb = crumbs ? Breadcrumbs::Note(stream, {.name = "presenter FSR"}) : 0;
     const u32 pp_crumb = crumbs ? Breadcrumbs::Note(stream, {.name = "presenter post process"}) : 0;
     draw_scheduler.Record([this, frame, image_view, image_size, frame_subresources, stream,
-                           fsr_crumb, pp_crumb, fsr = fsr_settings,
+                           fsr_crumb, pp_crumb, scene, clean, fsr = fsr_settings,
                            pp = pp_settings](vk::CommandBuffer cmdbuf) {
         // Frames of different submissions may be recorded on two threads at once.
         std::scoped_lock lock{passes_mutex};
@@ -437,6 +456,28 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             Breadcrumbs::Mark(cmdbuf, stream, pp_crumb, false);
         }
         pp_pass.Render(cmdbuf, input, image_size, *frame, pp);
+        if (clean.image) {
+        Frame clean_frame{};
+        clean_frame.width = clean.width;
+        clean_frame.height = clean.height;
+        clean_frame.image = clean.image;
+        clean_frame.image_view = clean.view;
+        const vk::ImageMemoryBarrier2 prepare{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+            .image = clean.image,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}};
+        cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &prepare});
+        const vk::Extent2D size{scene.width, scene.height};
+        const auto clean_view = fg_fsr_pass->Render(cmdbuf, scene.view, size,
+                                                    {clean.width, clean.height}, fsr, false);
+        auto clean_settings = pp;
+        clean_settings.srgb_input = 0;
+        pp_pass.Render(cmdbuf, clean_view, size, clean_frame, clean_settings);
+    }
         if (pp_crumb) {
             Breadcrumbs::Mark(cmdbuf, stream, pp_crumb, true);
         }
@@ -477,6 +518,8 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     // Request a free presentation frame.
     Frame* frame = GetRenderFrame();
 
+    frame->fg_input.reset();
+    frame->reflex_timing.reset();
     auto& scheduler = present_thread ? present_scheduler : draw_scheduler;
     scheduler.EndRendering();
 
@@ -561,6 +604,29 @@ void Presenter::WaitRendered(const Frame* frame) {
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+    // Host vblank refreshes can replay the last guest frame between real flips.
+    // Streamline already presents the generated frames. Replaying the old frame
+    // as ineligible would switch FG off and recreate its swapchain, then switch
+    // it back on at the next real flip (observed during loading/stutters).
+    // Still service focus/overlay changes through the normal disable path.
+    if (is_reusing_frame && Dlssg::GetFps().active && window.HasInputFocus() &&
+        !BbOverlay::CapturesInput()) {
+        static bool reported = false;
+        if (!std::exchange(reported, true)) {
+            std::puts("DLSSG: redundant vblank re-presents skipped while generating");
+        }
+        return;
+    }
+    static const bool profile_fg = [] {
+        const char* value = std::getenv("BB_DLSSG_TIMINGS");
+        return value && !std::strcmp(value, "1");
+    }();
+    const bool measure = profile_fg && is_game_frame && !is_reusing_frame &&
+                         Dlssg::UsesPresentationProxy();
+    const auto clock = [measure] {
+        return measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    };
+    const auto begin_start = clock();
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {
@@ -579,14 +645,22 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // Recreate the swapchain if the window was resized (or was minimised at the last try).
     if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight() ||
         !swapchain.IsPresentable()) {
+        std::scoped_lock submit_lock{Scheduler::submit_mutex};
+        Dlssg::Drain(instance);
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
         if (!swapchain.IsPresentable()) {
             free_frame();
             return;
         }
     }
+    Dlssg::Begin(instance, swapchain, frame->fg_input,
+        !is_reusing_frame && is_game_frame && !BbOverlay::CapturesInput(), window.HasInputFocus(),
+        is_reusing_frame ? nullptr : frame->reflex_timing);
+    const auto begin_end = clock();
 
     if (!swapchain.AcquireNextImage()) {
+        std::scoped_lock submit_lock{Scheduler::submit_mutex};
+        Dlssg::Drain(instance);
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
         if (!swapchain.AcquireNextImage()) {
             // User resizes the window too fast and GPU can't keep up. Skip this frame.
@@ -595,6 +669,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             return;
         }
     }
+    const auto acquire_end = clock();
 
     // Reset fence for queue submission. Do it here instead of GetRenderFrame() because we may
     // skip frame because of slow swapchain recreation. If a frame skip occurs, we skip signal
@@ -659,10 +734,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         };
         cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer,
                                vk::DependencyFlagBits::eByRegion, clear_done, {}, {});
+        const auto blit = MakeImageBlitFit(frame->width, frame->height, extent.width, extent.height);
         cmdbuf.blitImage(frame->image, vk::ImageLayout::eTransferSrcOptimal, swapchain_image,
                          vk::ImageLayout::eTransferDstOptimal,
-                         MakeImageBlitFit(frame->width, frame->height, extent.width, extent.height),
-                         vk::Filter::eLinear);
+                         blit, vk::Filter::eLinear);
+        const auto clean = Dlssg::PresentHudless(instance, cmdbuf, frame->fg_input, extent, blit);
         // bbport: the settings menu / FPS counter over the frame, at display resolution.
         BbGameMenu::Poll(); // the port's pages in the game's System menu
         const bool overlay = BbOverlay::Visible();
@@ -710,12 +786,19 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                                    vk::PipelineStageFlagBits::eBottomOfPipe,
                                    vk::DependencyFlagBits::eByRegion, {}, {}, to_present);
         }
+        if (clean.image) {
+            const auto format = swapchain.GetSurfaceFormat().format;
+            TemporalUpscaler::CaptureFrameGeneration(
+                instance, scheduler, {swapchain_image, format, extent.width, extent.height},
+                {clean.image, format, clean.width, clean.height}, vk::ImageLayout::ePresentSrcKHR);
+        }
     }
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.endDebugUtilsLabelEXT();
     }
 
     // Flush vulkan commands.
+    Dlssg::Tag(instance, cmdbuf, frame->fg_input);
 
     // bbport: the frame's submission goes out from a recording thread (BB_ASYNC_SUBMIT); this
     // one, waiting for it on the same queue, must not get there first.
@@ -726,13 +809,46 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     info.AddWait(swapchain.GetImageAcquiredSemaphore());
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
     info.AddSignal(swapchain.GetPresentReadySemaphore());
-    info.AddSignal(frame->present_done);
+    const bool proxy_present = Dlssg::UsesPresentationProxy();
+    if (!proxy_present) info.AddSignal(frame->present_done);
     scheduler.Flush(info);
 
+    Dlssg::SubmitEnd();
     // Present to swapchain.
+    const auto lock_start = clock();
     {
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        if (!swapchain.Present()) {
+        const auto lock_end = clock();
+        Dlssg::PresentStart();
+        const bool presented = swapchain.Present();
+        Dlssg::PresentEnd(instance, frame->fg_input);
+        const auto present_end = clock();
+        if (measure) {
+            // CPU wall times, not GPU execution or end-to-end input latency.
+            static std::array<double, 4> sums{};
+            static u32 samples{};
+            const auto ms = [](auto a, auto b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            sums[0] += ms(begin_start, begin_end);
+            sums[1] += ms(begin_end, acquire_end);
+            sums[2] += ms(lock_start, lock_end);
+            sums[3] += ms(lock_end, present_end);
+            if (++samples == 120) {
+                std::printf("DLSSG CPU: begin=%.3f acquire=%.3f submit_lock=%.3f present=%.3f ms fg=%d\n",
+                            sums[0] / samples, sums[1] / samples, sums[2] / samples,
+                            sums[3] / samples, Dlssg::GetFps().active);
+                samples = 0;
+                sums.fill(0);
+            }
+        }
+        if (proxy_present) {
+            // Blocking mode orders this after FG. Parallel mode keeps a separate
+            // plugin consumption lease, awaited only when this frame is reused.
+            Check(instance.GetPresentQueue().submit(vk::SubmitInfo{}, frame->present_done));
+        }
+        if (!presented) {
+            Dlssg::Drain(instance);
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
     }
@@ -777,6 +893,7 @@ Frame* Presenter::GetRenderFrame() {
         }
     }
 
+    Dlssg::WaitInput(instance, frame->fg_input);
     if (frame->width != expected_frame_width || frame->height != expected_frame_height ||
         frame->is_hdr != swapchain.GetHDR()) {
         RecreateFrame(frame, expected_frame_width, expected_frame_height);

@@ -4,9 +4,11 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <bitset>
 #include <cstring>
 #include <vector>
+#include <bit>
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_depth.h"
 #include "video_core/amdgpu/regs_primitive.h"
@@ -196,11 +198,57 @@ union Regs {
 // bbport: register blocks written by a stretch of packets, and their values at its end. The
 // draw-preparation scanner records one per submission so a worker reaches the state at the
 // start of any later submission without replaying the packets in between.
+#ifdef _LIBCPP_VERSION
+// Adapted from yumlevi's PR #6: libc++ lacks bitset's libstdc++ scan helpers.
+// Walk nonempty 64-bit words instead of testing every register block per draw.
+template <std::size_t N>
+class RegBlockBits {
+public:
+    void set(std::size_t bit) { words[bit / 64] |= u64(1) << (bit % 64); }
+    void reset() { words = {}; }
+    bool test(std::size_t bit) const { return (words[bit / 64] >> (bit % 64)) & 1; }
+    static constexpr std::size_t size() { return N; }
+    std::size_t FindFirst() const { return Scan(0); }
+    std::size_t FindNext(std::size_t bit) const { return bit + 1 >= N ? N : Scan(bit + 1); }
+
+private:
+    std::size_t Scan(std::size_t from) const {
+        std::size_t word = from / 64;
+        u64 bits = words[word] & (~u64(0) << (from % 64));
+        while (!bits) {
+            if (++word == words.size()) return N;
+            bits = words[word];
+        }
+        return std::min<std::size_t>(word * 64 + std::countr_zero(bits), N);
+    }
+    std::array<u64, (N + 63) / 64> words{};
+};
+#endif
+
 struct RegDirty {
     static constexpr u32 BlockWords = 32;
     static constexpr u32 NumBlocks = Regs::NumRegs / BlockWords;
+#ifdef _LIBCPP_VERSION
+    RegBlockBits<NumBlocks> blocks;
+#else
     std::bitset<NumBlocks> blocks;
+#endif
     bool reset = false; ///< ClearState: defaults, then only the blocks marked after it
+
+    template <typename Function>
+    void ForEachBlock(Function&& function) const {
+#ifdef _LIBCPP_VERSION
+        for (size_t block=blocks.FindFirst(); block<blocks.size(); block=blocks.FindNext(block))
+            function(block);
+#elif defined(__GLIBCXX__)
+        for (size_t block=blocks._Find_first(); block<blocks.size(); block=blocks._Find_next(block))
+            function(block);
+#else
+        // libc++ exposes only the standard bitset interface.
+        for (size_t block=0; block<blocks.size(); ++block)
+            if (blocks.test(block)) function(block);
+#endif
+    }
 
     void Mark(u32 word, u32 count) {
         if (count == 0 || word >= Regs::NumRegs) {
@@ -232,13 +280,11 @@ struct RegDelta {
         reset = dirty.reset;
         blocks.clear();
         words.clear();
-        for (u32 block = 0; block < RegDirty::NumBlocks; ++block) {
-            if (dirty.blocks.test(block)) {
-                blocks.push_back(u16(block));
-                const u32* src = regs.reg_array.data() + block * RegDirty::BlockWords;
-                words.insert(words.end(), src, src + RegDirty::BlockWords);
-            }
-        }
+        dirty.ForEachBlock([&](size_t block) {
+            blocks.push_back(u16(block));
+            const u32* src = regs.reg_array.data() + block * RegDirty::BlockWords;
+            words.insert(words.end(), src, src + RegDirty::BlockWords);
+        });
     }
     void Apply(Regs& regs) const {
         if (reset) {

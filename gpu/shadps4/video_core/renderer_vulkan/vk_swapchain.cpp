@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdio>
 #include <limits>
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -226,6 +227,9 @@ void Swapchain::FindPresentMode() {
                     vk::to_string(present_mode), vk::to_string(fallback));
         present_mode = fallback;
     }
+    std::printf("Presentation: requested=%s, selected=%s%s\n", requested_mode.c_str(),
+                vk::to_string(present_mode).c_str(),
+                present_mode == vk::PresentModeKHR::eImmediate ? " (allow tearing)" : "");
 }
 
 void Swapchain::SetSurfaceProperties() {

@@ -5,7 +5,9 @@
 #if defined(ANDROID)
 #define VK_USE_PLATFORM_ANDROID_KHR
 #elif defined(_WIN64)
+#ifndef VK_USE_PLATFORM_WIN32_KHR
 #define VK_USE_PLATFORM_WIN32_KHR
+#endif
 #elif defined(__APPLE__)
 #define VK_USE_PLATFORM_METAL_EXT
 #else
@@ -27,6 +29,8 @@
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
+
+#include "video_core/renderer_vulkan/vk_dlssg.h"
 
 namespace Vulkan {
 
@@ -67,7 +71,7 @@ vk::SurfaceKHR CreateSurface(vk::Instance instance, const Frontend::WindowSDL& e
 #if defined(VK_USE_PLATFORM_WIN32_KHR)
     if (window_info.type == Frontend::WindowSystemType::Windows) {
         const vk::Win32SurfaceCreateInfoKHR win32_ci = {
-            .hinstance = nullptr,
+            .hinstance = static_cast<HINSTANCE>(window_info.display_connection),
             .hwnd = static_cast<HWND>(window_info.render_surface),
         };
 
@@ -273,7 +277,7 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
 
     static vk::detail::DynamicLoader dl;
     VULKAN_HPP_DEFAULT_DISPATCHER.init(
-        dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
+        Dlssg::Loader(dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr")));
 
     const auto [available_version_result, available_version] =
         VULKAN_HPP_DEFAULT_DISPATCHER.vkEnumerateInstanceVersion
@@ -288,10 +292,6 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
 
     const auto layers = GetInstanceLayers(enable_validation, enable_crash_diagnostic);
     auto extensions = GetLayerExtensions(GetInstanceExtensions(window_type, true), layers);
-    // bbport: DLSS (optional bridge library) needs its own instance extensions.
-    if (Dlss* dlss = Dlss::Get()) {
-        dlss->AppendInstanceExtensions(extensions);
-    }
 
     const vk::ApplicationInfo application_info = {
         .pApplicationName = "shadPS4",

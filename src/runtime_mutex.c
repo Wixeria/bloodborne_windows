@@ -1,10 +1,9 @@
-/* Linux pthread-backed opaque PS4 mutex handles. No guest threads yet. */
+/* Opaque PS4 mutex handles on pthreads (Linux or Windows winpthreads). */
 #define _GNU_SOURCE
 #include "runtime.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifndef _WIN32
 #include <pthread.h>
 #include <errno.h>
 #include <time.h>
@@ -197,7 +196,7 @@ static ABI int32_t cond_broadcast(GuestCond **cond) {
     if (e) return e;
     ++wakeups; return orbis_error(pthread_cond_broadcast(&(*cond)->native));
 }
-/* PS4 struct timespec is {int64 sec, int64 nsec}, identical to Linux x86-64. */
+/* PS4 timespec has two int64 fields; Windows host long is only 32 bits. */
 typedef struct { int64_t sec, nsec; } GuestTimespec;
 static ABI int32_t cond_abs_timedwait(GuestCond **cond, GuestMutex **mutex, const GuestTimespec *abs) {
     if (!abs || abs->nsec < 0 || abs->nsec >= 1000000000) return orbis_error(EINVAL);
@@ -257,26 +256,3 @@ void runtime_mutex_report(void) {
     printf("Runtime: mutexes created=%zu, locks=%zu, unlocks=%zu\n", created, locks, unlocks);
     printf("Runtime: condition variables created=%zu, waits=%zu, wakeups=%zu\n", conds, waits, wakeups);
 }
-#else
-static ABI int32_t posix_cond_init(GuestCond **c, void **a) { return posix_result(cond_init(c, a, NULL)); }
-static ABI int32_t posix_cond_destroy(GuestCond **c) { return posix_result(cond_destroy(c)); }
-static ABI int32_t posix_cond_wait(GuestCond **c, GuestMutex **m) { return posix_result(cond_wait(c, m)); }
-static ABI int32_t posix_cond_timedwait(GuestCond **c, GuestMutex **m, const GuestTimespec *t) { return posix_result(cond_abs_timedwait(c, m, t)); }
-static ABI int32_t posix_cond_signal(GuestCond **c) { return posix_result(cond_signal(c)); }
-static ABI int32_t posix_cond_broadcast(GuestCond **c) { return posix_result(cond_broadcast(c)); }
-uintptr_t runtime_mutex_resolve(const char *name) {
-    if (!strcmp(name,"0TyVk4MSLt0#I#J")) return (uintptr_t)posix_cond_init;
-    if (!strcmp(name,"RXXqi4CtF8w#I#J")) return (uintptr_t)posix_cond_destroy;
-    if (!strcmp(name,"Op8TBGY5KHg#I#J")) return (uintptr_t)posix_cond_wait;
-    if (!strcmp(name,"27bAgiJmOh0#I#J")) return (uintptr_t)posix_cond_timedwait;
-    if (!strcmp(name,"2MOy+rUfuhQ#I#J")) return (uintptr_t)posix_cond_signal;
-    if (!strcmp(name,"mkx2fVhNMsg#I#J")) return (uintptr_t)posix_cond_broadcast;
-    if (!strcmp(name,"2Tb92quprl0#p#J")) return (uintptr_t)cond_init;
-    if (!strcmp(name,"g+PZd2hiacg#p#J")) return (uintptr_t)cond_destroy;
-    if (!strcmp(name,"WKAXJ4XBPQ4#p#J")) return (uintptr_t)cond_wait;
-    if (!strcmp(name,"BmMjYxmew1w#p#J")) return (uintptr_t)cond_timedwait;
-    if (!strcmp(name,"kDh-NfxgMtE#p#J")) return (uintptr_t)cond_signal;
-    if (!strcmp(name,"JGgj7Uvrl+A#p#J")) return (uintptr_t)cond_broadcast;
-    if (!strcmp(name,"IafI2PxcPnQ#p#J")) return (uintptr_t)mutex_timedlock; (void)name; return 0; }
-void runtime_mutex_report(void) { puts("Runtime: Windows mutex backend not implemented"); }
-#endif

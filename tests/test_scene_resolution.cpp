@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Exercises the production target/resolve path on Vulkan (Lavapipe works, no game/window).
+#include "gpu_release_headers.h"
 #include <cassert>
 #include <cmath>
 #include <cstdio>

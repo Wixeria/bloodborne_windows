@@ -1,3 +1,17 @@
+#ifdef _WIN32
+#include "bbport_gnm_hooks.h"
+#include <cstdio>
+#include <cstdlib>
+namespace BbGnmHooks {
+void PatchImage(unsigned char*, std::uint64_t) {
+    const char* enabled = std::getenv("BB_GNM_CENSUS");
+    if (enabled && enabled[0] == '1')
+        std::printf("Gnm census: Linux entry hooks are unavailable on Windows\n");
+}
+void CheckSubmission(const std::uint32_t*, std::uint64_t) {}
+DriverWrite::~DriverWrite() = default;
+}
+#else
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_gnm_hooks.h"
 
@@ -614,3 +628,5 @@ DriverWrite::~DriverWrite() {
     Mark(std::uint32_t(Count), begin, end);
 }
 } // namespace BbGnmHooks
+
+#endif

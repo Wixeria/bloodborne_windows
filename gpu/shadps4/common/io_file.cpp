@@ -20,7 +20,7 @@
 #include <unistd.h>
 #endif
 
-#ifdef _MSC_VER
+#ifdef _WIN32
 #define fileno _fileno
 #define fseeko _fseeki64
 #define ftello _ftelli64

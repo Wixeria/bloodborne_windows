@@ -287,6 +287,56 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
     return info;
 }
 
+/// bbport BB_ASYNC_PIPELINES: worker threads creating graphics pipelines (the driver's compile,
+/// vkCreateGraphicsPipelines, with its own VkPipelineCache synchronization). Jobs run in order.
+class PipelineCompiler {
+public:
+    explicit PipelineCompiler(u32 threads) {
+        for (u32 i = 0; i < threads; ++i) {
+            workers.emplace_back([this] { Run(); });
+        }
+    }
+    ~PipelineCompiler() {
+        {
+            std::scoped_lock lk{mutex};
+            stop = true;
+        }
+        cv.notify_all();
+        for (auto& worker : workers) {
+            worker.join();
+        }
+    }
+    void Submit(std::function<void()> job) {
+        {
+            std::scoped_lock lk{mutex};
+            jobs.push_back(std::move(job));
+        }
+        cv.notify_one();
+    }
+
+private:
+    void Run() {
+        for (;;) {
+            std::function<void()> job;
+            {
+                std::unique_lock lk{mutex};
+                cv.wait(lk, [&] { return stop || !jobs.empty(); });
+                if (jobs.empty()) {
+                    return; // stopping, every job done
+                }
+                job = std::move(jobs.front());
+                jobs.pop_front();
+            }
+            job();
+        }
+    }
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<std::function<void()>> jobs;
+    std::vector<std::thread> workers;
+    bool stop = false;
+};
+
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_, u32 sparse_page_shift)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
@@ -367,56 +417,6 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     pipeline_cache = std::move(cache);
 }
 
-/// bbport BB_ASYNC_PIPELINES: worker threads creating graphics pipelines (the driver's compile,
-/// vkCreateGraphicsPipelines, with its own VkPipelineCache synchronization). Jobs run in order.
-class PipelineCompiler {
-public:
-    explicit PipelineCompiler(u32 threads) {
-        for (u32 i = 0; i < threads; ++i) {
-            workers.emplace_back([this] { Run(); });
-        }
-    }
-    ~PipelineCompiler() {
-        {
-            std::scoped_lock lk{mutex};
-            stop = true;
-        }
-        cv.notify_all();
-        for (auto& worker : workers) {
-            worker.join();
-        }
-    }
-    void Submit(std::function<void()> job) {
-        {
-            std::scoped_lock lk{mutex};
-            jobs.push_back(std::move(job));
-        }
-        cv.notify_one();
-    }
-
-private:
-    void Run() {
-        for (;;) {
-            std::function<void()> job;
-            {
-                std::unique_lock lk{mutex};
-                cv.wait(lk, [&] { return stop || !jobs.empty(); });
-                if (jobs.empty()) {
-                    return; // stopping, every job done
-                }
-                job = std::move(jobs.front());
-                jobs.pop_front();
-            }
-            job();
-        }
-    }
-    std::mutex mutex;
-    std::condition_variable cv;
-    std::deque<std::function<void()>> jobs;
-    std::vector<std::thread> workers;
-    bool stop = false;
-};
-
 struct PipelineCache::PendingPipeline {
     std::mutex mutex;
     std::condition_variable cv;
@@ -431,14 +431,18 @@ PipelineCache::~PipelineCache() = default;
 // bbport: shader/pipeline compile time on the GPU thread, reported by BB_FRAME_STATS.
 std::atomic<u64> g_bb_compile_ns;
 std::atomic<u32> g_bb_compiles;
+std::atomic<u64> g_bb_total_compile_ns, g_bb_total_compiles;
 namespace {
 struct CompileTimer {
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
     ~CompileTimer() {
-        g_bb_compile_ns += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        const auto elapsed = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    std::chrono::steady_clock::now() - start)
                                    .count());
+        g_bb_compile_ns += elapsed;
+        g_bb_total_compile_ns += elapsed;
         ++g_bb_compiles;
+        ++g_bb_total_compiles;
     }
 };
 } // namespace
@@ -1088,8 +1092,8 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
         // pointers in the registers; ahead of the GPU thread that memory may already be
         // reused. A fault returns here (runtime_fault_recover) and the draw is left to the GPU
         // thread. A jump out of the specialization leaks its partial allocations (rare).
-        sigjmp_buf recover;
-        if (sigsetjmp(recover, 0)) {
+        BbFaultBuffer recover;
+        if (bb_fault_setjmp(recover)) {
             worker.failed = true;
             return {};
         }

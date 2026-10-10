@@ -18,6 +18,9 @@
 #include <future>
 #include <mutex>
 #include <queue>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -164,7 +167,12 @@ bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector
                 }
                 std::error_code ec;
                 if (written) {
+#ifdef _WIN32
+                    if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+                        ec = std::error_code(GetLastError(), std::system_category());
+#else
                     std::filesystem::rename(temp, path, ec);
+#endif
                 }
                 if (!written || ec) {
                     LOG_ERROR(Render, "Failed to write {}", path.string());

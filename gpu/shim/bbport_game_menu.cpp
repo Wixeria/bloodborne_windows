@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_game_menu.h"
 
+#ifdef _WIN32
+// Keep the existing English Insert UI until the game's native menu detours are ported.
+namespace BbGameMenu {
+void PatchImage(unsigned char*, std::uint64_t) {}
+void Poll() {}
+}
+#else
+
 #include <sys/mman.h>
 #include <unistd.h>
 #include <algorithm>
@@ -636,3 +644,4 @@ void Poll() {
 }
 
 } // namespace BbGameMenu
+#endif

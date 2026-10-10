@@ -104,6 +104,20 @@ class GameCheckTests(unittest.TestCase):
         os.environ['BB_SKIP_GAME_CHECK'] = '1'
         self.assertIsNone(game_check.problem(self.game('CUSA03173', '01.00')))
 
+    def test_known_windows_patched_image(self):
+        self.assertIsNone(game_check.problem(self.game('CUSA03173', '01.09'),
+                                            game_check.WINDOWS_PATCHED_IMAGE))
+
+    def test_patched_image_requires_matching_metadata(self):
+        self.assertEqual(game_check.problem(self.game('CUSA03173', '01.00'),
+                                           game_check.WINDOWS_PATCHED_IMAGE)[0], 'missing_update')
+        self.assertEqual(game_check.problem(self.game('CUSA00207', '01.09'),
+                                           game_check.WINDOWS_PATCHED_IMAGE)[0], 'other_title')
+
+    def test_unknown_modification_still_rejected(self):
+        self.assertEqual(game_check.problem(self.game('CUSA03173', '01.09'), '0' * 64)[0],
+                         'wrong_eboot')
+
     def test_every_problem_is_explained(self):
         for kind in ('missing_update', 'wrong_eboot', 'other_title', 'unreadable',
                      'damaged_files'):

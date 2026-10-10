@@ -23,11 +23,12 @@ public:
     explicit BindHelper(bool enabled) {
         if (enabled) {
             thread = std::jthread([this](std::stop_token stop) { Run(stop); });
+            running = true;
         }
     }
 
     ~BindHelper() {
-        if (thread.joinable()) {
+        if (running) {
             thread.request_stop();
             posted.fetch_add(1, std::memory_order_seq_cst);
             posted.notify_one();
@@ -35,7 +36,7 @@ public:
     }
 
     [[nodiscard]] bool Available() const noexcept {
-        return thread.joinable();
+        return running;
     }
 
     /// True on the helper thread (its callees must not join it).
@@ -117,6 +118,9 @@ private:
     alignas(64) std::atomic<u64> done{0};
     alignas(64) std::atomic<bool> sleeping{false};
     std::jthread thread;
+    // Immutable after construction. Avoid GetThreadId on every binding
+    // availability check (PR #6, yumlevi); jthread still owns stop/join.
+    bool running = false;
 };
 
 } // namespace Vulkan

@@ -1,32 +1,53 @@
-out/
-__pycache__/
-user/
-*.mp4
-bbport.ini
-fsr4_shaders/
-pgo/
-*.png
-last_run.log
-dist/
-packaging/runtime-paths.nix
-fsr4_411/
-vkd3d-proton.cache
-tools/fsr4cap/*.exe
-perf.data
-# Local leftovers: patch backups, generated SPIR-V, analysis outputs, test saves and routes
-*.orig
-/*.spv
+# Build and packaging output
+/out/
+/dist/
+/old-builds/
+/build/
+/build-*/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake-build-*/
+/launcher/rust/target/
+/pgo/
+/fsr4_shaders/
+/fsr4_411/
+/packaging/runtime-paths.nix
+
+# Local game files, saves, and runtime settings
+/user/
+/mods.json
+/patches.json
+/bbport.ini
+/last_run.log
+/vkd3d-proton.cache
+/perf.data
 /1060/
+*.mp4
+*.log
+*.orig
+*.user
+*.suo
+*.dmp
+*.mdmp
+
+# Local routes and analysis artifacts
 /docs/savedata_route/
 /docs/route*.txt
 /docs/route_run.log
 /bloodborne_upscalers_*.md
-mods.json
-patches.json
-# Local: game logs, messages and archives from users, internal plans
+
+# Developer machine state
+/.vscode/
+/.vs/
+/.idea/
+__pycache__/
+*.py[cod]
+
+# Generated captures and binaries from the local FSR capture tool
+/tools/fsr4cap/*.exe
+/*.spv
 /logs/
 /message*.txt
 /*.zip
 /docs/ISSUE_ACTION_PLAN_*.md
-# AMD FidelityFX DLLs (FSR 4.1.1 is built from the user's own): never in the repository
 *.dll

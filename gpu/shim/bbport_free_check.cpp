@@ -1,3 +1,18 @@
+#ifdef _WIN32
+#include "bbport_free_check.h"
+namespace BbFreeCheck {
+bool Enabled() { return false; }
+void Check(std::uint64_t, std::uint64_t, const void*, Source, std::uint64_t) {}
+std::uint64_t NextFenceSeq() { return 0; }
+void NoteFenceDecoded(std::uint64_t, std::uint64_t, const void*, const void*, std::uint64_t) {}
+void NoteFenceWriting(std::uint64_t) {}
+void NoteFenceWritten(std::uint64_t, std::uint64_t) {}
+bool OnTrapFault(void*, std::uint64_t) { return false; }
+bool OnStaleTrapFault(std::uint64_t) { return false; }
+void NoteSubmit(std::uint64_t, const void*, std::uint64_t) {}
+void DumpAtFault(std::uint64_t, std::uint64_t) {}
+}
+#else
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_free_check.h"
 
@@ -1088,3 +1103,5 @@ bool OnStaleTrapFault(u64 address) {
     return true;
 }
 } // namespace BbFreeCheck
+
+#endif
